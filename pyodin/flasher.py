@@ -6,7 +6,7 @@ High-level API for firmware flashing operations.
 
 import time
 import struct
-from typing import Optional, Callable, List
+from typing import Optional, Callable, List, Dict
 
 from .usb_device import UsbDevice, DeviceInfo
 from .download_engine import DownloadEngine, DownloadProgress
@@ -286,11 +286,61 @@ class OdinFlasher:
         
         return pit
     
+    def flash_multi_section(
+        self,
+        firmware_sections: Dict[str, FirmwareData],
+        pit_data: Optional[bytes] = None,
+        reboot: bool = True,
+        reboot_to_download: bool = False,
+        progress_callback: Optional[Callable[[DownloadProgress], None]] = None
+    ) -> bool:
+        """
+        Flash multiple firmware sections (BL, AP, CP, CSC, etc.) to device
+        
+        Args:
+            firmware_sections: Dict mapping section names to FirmwareData objects
+                              e.g., {"BL": fw_bl, "AP": fw_ap, "CP": fw_cp, "CSC": fw_csc}
+            pit_data: PIT data (optional)
+            reboot: Whether to reboot after flashing
+            reboot_to_download: Whether to reboot to download mode (default: False = reboot to system)
+            progress_callback: Progress callback function
+            
+        Returns:
+            True if flashing successful
+        """
+        if not self.is_connected:
+            raise OdinConnectionError("Not connected to device")
+        
+        if self.download_engine is None:
+            raise OdinException("Download engine not initialized")
+        
+        # Merge all firmware sections into one
+        merged_firmware = FirmwareData()
+        for section_name, firmware_data in firmware_sections.items():
+            self.log(f"Adding section {section_name}: {len(firmware_data.items)} items")
+            merged_firmware.items.extend(firmware_data.items)
+            
+            # Use PIT from first section that has it
+            if firmware_data.pit_data and not merged_firmware.pit_data:
+                merged_firmware.pit_data = firmware_data.pit_data
+        
+        self.log(f"Total merged items: {len(merged_firmware.items)}")
+        
+        # Flash the merged firmware
+        return self.flash(
+            merged_firmware,
+            pit_data=pit_data,
+            reboot=reboot,
+            reboot_to_download=reboot_to_download,
+            progress_callback=progress_callback
+        )
+    
     def flash(
         self,
         firmware_data: FirmwareData,
         pit_data: Optional[bytes] = None,
         reboot: bool = True,
+        reboot_to_download: bool = False,
         progress_callback: Optional[Callable[[DownloadProgress], None]] = None
     ) -> bool:
         """
@@ -300,6 +350,7 @@ class OdinFlasher:
             firmware_data: Firmware data to flash
             pit_data: PIT data (optional)
             reboot: Whether to reboot after flashing
+            reboot_to_download: Whether to reboot to download mode (default: False = reboot to system)
             progress_callback: Progress callback function
             
         Returns:
@@ -440,9 +491,10 @@ class OdinFlasher:
             
             # Reboot device if requested
             if reboot:
-                self.log("Rebooting device...")
+                boot_target = "download mode" if reboot_to_download else "system"
+                self.log(f"Rebooting device to {boot_target}...")
                 try:
-                    self.download_engine.reboot_device()
+                    self.download_engine.reboot_device(to_download_mode=reboot_to_download)
                     time.sleep(1)  # Wait a bit before disconnect
                 except:
                     # Device disconnects during reboot - this is normal
@@ -518,5 +570,4 @@ class OdinFlasher:
         """Context manager exit"""
         if self.is_connected:
             self.disconnect_device()
-
 
