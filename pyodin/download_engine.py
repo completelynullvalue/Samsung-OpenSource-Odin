@@ -852,10 +852,23 @@ class DownloadEngine:
         struct.pack_into("<III", buf, 0, cmd, sub, param)
         return self.usb_device.write(bytes(buf[:self.packet_size]))
     
-    def reboot_device(self) -> bool:
-        """Reboot device (cmd 103/2)"""
+    def reboot_device(self, to_download_mode: bool = False) -> bool:
+        """
+        Reboot device
+        
+        Args:
+            to_download_mode: If True, reboot to download mode. If False, reboot to system (normal boot)
+        
+        Commands (based on Odin protocol):
+        - 103/0 = End session (no reboot)
+        - 103/1 = Reboot to system (normal boot)
+        - 103/2 = Reboot to download mode
+        """
+        sub_command = 2 if to_download_mode else 1  # Use 1 for system reboot, not 0
+        self.log(f"Rebooting device (sub={sub_command}, to_download={to_download_mode})...")
+        
         try:
-            self._send_packet(103, 2, 0)
+            self._send_packet(103, sub_command, 0)
         except:
             # Device may disconnect before write completes
             pass
@@ -864,4 +877,3 @@ class DownloadEngine:
         except:
             pass
         return True
-
