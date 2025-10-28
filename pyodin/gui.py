@@ -10,7 +10,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 
 from .flasher import OdinFlasher
 from .firmware import FirmwareData
@@ -35,12 +35,21 @@ class OdinGUI:
         # State variables
         self.flasher: Optional[OdinFlasher] = None
         self.firmware_data: Optional[FirmwareData] = None
+        self.firmware_sections: Dict[str, Optional[FirmwareData]] = {
+            "BL": None,
+            "AP": None,
+            "CP": None,
+            "CSC": None
+        }
         self.device_info: Optional[DeviceInfo] = None
         self.is_flashing = False
         self.is_connected = False
         
-        # File paths
-        self.firmware_path = tk.StringVar()
+        # File paths for each section
+        self.bl_path = tk.StringVar()
+        self.ap_path = tk.StringVar()
+        self.cp_path = tk.StringVar()
+        self.csc_path = tk.StringVar()
         self.pit_path = tk.StringVar()
         
         # Options
@@ -186,25 +195,55 @@ class OdinGUI:
         file_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=5)
         file_frame.columnconfigure(1, weight=1)
         
-        # Firmware file
-        ttk.Label(file_frame, text="Firmware:").grid(row=0, column=0, sticky=tk.W)
-        firmware_entry = ttk.Entry(file_frame, textvariable=self.firmware_path, state="readonly")
-        firmware_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
+        # BL (Bootloader) file
+        ttk.Label(file_frame, text="BL (Bootloader):").grid(row=0, column=0, sticky=tk.W)
+        bl_entry = ttk.Entry(file_frame, textvariable=self.bl_path, state="readonly")
+        bl_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
         ttk.Button(
             file_frame,
             text="Browse...",
-            command=self.browse_firmware
+            command=lambda: self.browse_section_firmware("BL", self.bl_path)
         ).grid(row=0, column=2)
         
+        # AP (System) file
+        ttk.Label(file_frame, text="AP (System):").grid(row=1, column=0, sticky=tk.W, pady=(5, 0))
+        ap_entry = ttk.Entry(file_frame, textvariable=self.ap_path, state="readonly")
+        ap_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5, pady=(5, 0))
+        ttk.Button(
+            file_frame,
+            text="Browse...",
+            command=lambda: self.browse_section_firmware("AP", self.ap_path)
+        ).grid(row=1, column=2, pady=(5, 0))
+        
+        # CP (Modem) file
+        ttk.Label(file_frame, text="CP (Modem):").grid(row=2, column=0, sticky=tk.W, pady=(5, 0))
+        cp_entry = ttk.Entry(file_frame, textvariable=self.cp_path, state="readonly")
+        cp_entry.grid(row=2, column=1, sticky=(tk.W, tk.E), padx=5, pady=(5, 0))
+        ttk.Button(
+            file_frame,
+            text="Browse...",
+            command=lambda: self.browse_section_firmware("CP", self.cp_path)
+        ).grid(row=2, column=2, pady=(5, 0))
+        
+        # CSC (Consumer Software Customization) file
+        ttk.Label(file_frame, text="CSC (Customization):").grid(row=3, column=0, sticky=tk.W, pady=(5, 0))
+        csc_entry = ttk.Entry(file_frame, textvariable=self.csc_path, state="readonly")
+        csc_entry.grid(row=3, column=1, sticky=(tk.W, tk.E), padx=5, pady=(5, 0))
+        ttk.Button(
+            file_frame,
+            text="Browse...",
+            command=lambda: self.browse_section_firmware("CSC", self.csc_path)
+        ).grid(row=3, column=2, pady=(5, 0))
+        
         # PIT file (optional)
-        ttk.Label(file_frame, text="PIT File:").grid(row=1, column=0, sticky=tk.W, pady=(10, 0))
+        ttk.Label(file_frame, text="PIT File (Optional):").grid(row=4, column=0, sticky=tk.W, pady=(10, 0))
         pit_entry = ttk.Entry(file_frame, textvariable=self.pit_path, state="readonly")
-        pit_entry.grid(row=1, column=1, sticky=(tk.W, tk.E), padx=5, pady=(10, 0))
+        pit_entry.grid(row=4, column=1, sticky=(tk.W, tk.E), padx=5, pady=(10, 0))
         ttk.Button(
             file_frame,
             text="Browse...",
             command=self.browse_pit
-        ).grid(row=1, column=2, pady=(10, 0))
+        ).grid(row=4, column=2, pady=(10, 0))
     
     def create_options_section(self, parent):
         """Create options section"""
@@ -394,11 +433,11 @@ class OdinGUI:
         self.log("Refreshing device detection...", "info")
         self.detect_device()
     
-    def browse_firmware(self):
-        """Browse for firmware file"""
+    def browse_section_firmware(self, section_name: str, path_var: tk.StringVar):
+        """Browse for firmware file for a specific section (BL, AP, CP, CSC)"""
         try:
             filename = filedialog.askopenfilename(
-                title="Select Firmware File",
+                title=f"Select {section_name} Firmware File",
                 filetypes=[
                     ("Firmware files", "*.tar.md5 *.tar *.tar.gz *.bin"),
                     ("All files", "*.*")
@@ -406,14 +445,14 @@ class OdinGUI:
             )
             
             if filename:
-                self.firmware_path.set(filename)
-                self.log(f"Selected firmware: {Path(filename).name}", "info")
+                path_var.set(filename)
+                self.log(f"Selected {section_name}: {Path(filename).name}", "info")
                 
                 # Try to parse firmware info
-                self.parse_firmware_info(filename)
+                self.parse_section_firmware_info(section_name, filename)
         
         except Exception as e:
-            self.log(f"✗ Error selecting file: {e}", "error")
+            self.log(f"✗ Error selecting {section_name} file: {e}", "error")
             messagebox.showerror("Error", f"Failed to open file browser:\n\n{e}")
     
     def browse_pit(self):
@@ -430,11 +469,11 @@ class OdinGUI:
             self.pit_path.set(filename)
             self.log(f"Selected PIT: {Path(filename).name}", "info")
     
-    def parse_firmware_info(self, firmware_path: str):
-        """Parse and display firmware information"""
+    def parse_section_firmware_info(self, section_name: str, firmware_path: str):
+        """Parse and display firmware information for a specific section"""
         def parse_thread():
             try:
-                self.root.after(0, self.log, "Parsing firmware...", "info")
+                self.root.after(0, self.log, f"Parsing {section_name}...", "info")
                 
                 if not self.flasher:
                     self.flasher = OdinFlasher(verbose=False)
@@ -444,9 +483,10 @@ class OdinGUI:
                     verify_hash=False  # Don't verify yet
                 )
                 
-                self.firmware_data = firmware_data
+                # Store in firmware sections
+                self.firmware_sections[section_name] = firmware_data
                 
-                self.root.after(0, self.log, f"✓ Firmware parsed: {len(firmware_data.items)} items", "success")
+                self.root.after(0, self.log, f"✓ {section_name} parsed: {len(firmware_data.items)} items", "success")
                 
                 if firmware_data.md5_hash:
                     self.root.after(0, self.log, f"  MD5: {firmware_data.md5_hash}", "info")
@@ -457,17 +497,17 @@ class OdinGUI:
             
             except OdinException as e:
                 self.root.after(0, self.log, f"✗ Odin error: {e.message}", "error")
-                self.root.after(0, messagebox.showerror, "Parse Error", f"Failed to parse firmware:\n\n{e.message}")
-                self.firmware_data = None
+                self.root.after(0, messagebox.showerror, "Parse Error", f"Failed to parse {section_name}:\n\n{e.message}")
+                self.firmware_sections[section_name] = None
             
             except Exception as e:
                 import traceback
                 error_details = traceback.format_exc()
-                self.root.after(0, self.log, f"✗ Failed to parse firmware: {e}", "error")
+                self.root.after(0, self.log, f"✗ Failed to parse {section_name}: {e}", "error")
                 self.root.after(0, self.log, f"Details: {error_details}", "error")
                 self.root.after(0, messagebox.showerror, "Parse Error", 
-                               f"Failed to parse firmware:\n\n{str(e)}\n\nCheck log for details.")
-                self.firmware_data = None
+                               f"Failed to parse {section_name}:\n\n{str(e)}\n\nCheck log for details.")
+                self.firmware_sections[section_name] = None
         
         # Run parsing in background thread to avoid blocking UI
         thread = threading.Thread(target=parse_thread, daemon=True)
@@ -475,9 +515,11 @@ class OdinGUI:
     
     def start_flashing(self):
         """Start firmware flashing"""
-        # Validation
-        if not self.firmware_path.get():
-            messagebox.showerror("Error", "Please select a firmware file")
+        # Validation - check if at least one section is selected
+        selected_sections = [name for name, data in self.firmware_sections.items() if data is not None]
+        
+        if not selected_sections:
+            messagebox.showerror("Error", "Please select at least one firmware section (BL, AP, CP, or CSC)")
             return
         
         if self.option_pit.get() and not self.pit_path.get():
@@ -488,10 +530,14 @@ class OdinGUI:
             messagebox.showerror("Error", "No device connected")
             return
         
+        # Build confirmation message
+        sections_str = ", ".join(selected_sections)
+        
         # Confirmation
         result = messagebox.askyesno(
             "Confirm Flashing",
-            "⚠️ WARNING: This will flash firmware to your device!\n\n"
+            f"⚠️ WARNING: This will flash firmware to your device!\n\n"
+            f"Selected sections: {sections_str}\n\n"
             "- All data will be erased\n"
             "- Device may be bricked if interrupted\n"
             "- Ensure device has >50% battery\n"
@@ -518,13 +564,25 @@ class OdinGUI:
             # Create flasher
             self.flasher = OdinFlasher(verbose=self.option_verbose.get())
             
-            # Load firmware
-            self.root.after(0, self.log, "[1/4] Loading firmware...", "info")
-            firmware = self.flasher.load_firmware(
-                self.firmware_path.get(),
-                verify_hash=self.option_verify.get()
-            )
-            self.root.after(0, self.log, f"✓ Loaded {len(firmware.items)} items", "success")
+            # Filter out None sections
+            sections_to_flash = {name: data for name, data in self.firmware_sections.items() if data is not None}
+            
+            self.root.after(0, self.log, "[1/4] Loading firmware sections...", "info")
+            self.root.after(0, self.log, f"  Sections to flash: {', '.join(sections_to_flash.keys())}", "info")
+            
+            # Re-load firmware with hash verification if enabled
+            if self.option_verify.get():
+                for section_name in sections_to_flash.keys():
+                    path_var = getattr(self, f"{section_name.lower()}_path")
+                    path = path_var.get()
+                    if path:
+                        self.root.after(0, self.log, f"  Verifying {section_name}...", "info")
+                        firmware = self.flasher.load_firmware(path, verify_hash=True)
+                        sections_to_flash[section_name] = firmware
+                        self.root.after(0, self.log, f"  ✓ {section_name} verified", "success")
+            
+            total_items = sum(len(fw.items) for fw in sections_to_flash.values())
+            self.root.after(0, self.log, f"✓ Loaded {total_items} total items from {len(sections_to_flash)} sections", "success")
             
             # Load PIT if needed
             pit_data = None
@@ -539,11 +597,12 @@ class OdinGUI:
             self.root.after(0, self.log, f"✓ Connected: {device.model_name or device.product}", "success")
             
             # Flash firmware
-            self.root.after(0, self.log, "[3/4] Flashing firmware...", "info")
-            success = self.flasher.flash(
-                firmware,
+            self.root.after(0, self.log, "[3/4] Flashing firmware sections...", "info")
+            success = self.flasher.flash_multi_section(
+                sections_to_flash,
                 pit_data=pit_data,
                 reboot=self.option_reboot.get(),
+                reboot_to_download=False,  # Reboot to system, not download mode
                 progress_callback=self.update_progress
             )
             
@@ -551,10 +610,11 @@ class OdinGUI:
                 self.root.after(0, self.log, "[4/4] ✓ Firmware flashed successfully!", "success")
                 
                 if self.option_reboot.get():
-                    self.root.after(0, self.log, "  Device is rebooting...", "info")
+                    self.root.after(0, self.log, "  Device is rebooting to system...", "info")
                 
                 self.root.after(0, messagebox.showinfo, "Success",
                                "Firmware flashed successfully!\n\n"
+                               "Device is rebooting to system.\n"
                                "First boot may take 5-10 minutes.")
             else:
                 self.root.after(0, self.log, "[4/4] ✗ Flashing failed!", "error")
@@ -687,4 +747,3 @@ def main():
 if __name__ == '__main__':
     import sys
     sys.exit(main())
-
