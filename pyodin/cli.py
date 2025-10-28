@@ -112,6 +112,7 @@ def cmd_flash(args):
             firmware_data,
             pit_data=pit_data,
             reboot=not args.no_reboot,
+            reboot_to_download=False,  # Always reboot to system, not download mode
             progress_callback=progress_callback
         )
         
@@ -121,7 +122,7 @@ def cmd_flash(args):
             print(f"\n[4/4] ✓ Firmware flashed successfully!")
             
             if not args.no_reboot:
-                print(f"      Device is rebooting...")
+                print(f"      Device is rebooting to system...")
             
             flasher.disconnect_device()
             return 0
@@ -311,4 +312,3 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-
