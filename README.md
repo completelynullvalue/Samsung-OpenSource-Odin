@@ -1,4 +1,5 @@
-<img width="1891" height="976" alt="image" src="https://github.com/user-attachments/assets/815e650c-27af-4991-bfc2-f101f62842a9" />
+<img width="918" height="624" alt="image" src="https://github.com/user-attachments/assets/e97ef6a1-84c1-475c-b3d6-f29d49f01c22" />
+<img width="910" height="656" alt="image" src="https://github.com/user-attachments/assets/0aa68a2b-6ac1-4e85-9de0-6254746f2aa0" />
 
 
 To create this, I did the following:
@@ -6,8 +7,10 @@ To create this, I did the following:
 - Trained an AI on this code.
 - Created an equivalent reconstruction of that code, ported to Python 3!
 
-Quirks
-- MD5 will only pass for AP, uncheck it if flashing BL, etc.
-
  Windows note:
 - The windows version DOES require Zadig to set the USB driver of your Samsung device to libusbK.
+
+Additional options:
+- OEM Unlock (only for some devices)
+- Disable signature verification (For flashing client side, on Bootloader it will STILL enforce)
+- Option Lock
