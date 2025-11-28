@@ -15,7 +15,8 @@ from .firmware import FirmwareData, FirmwareItem
 from .exceptions import (
     OdinProtocolError,
     OdinConnectionError,
-    OdinTimeoutError
+    OdinTimeoutError,
+    OdinUSBError
 )
 from .constants import (
     OdinCommand,
@@ -125,7 +126,7 @@ class DownloadEngine:
         1. Handshake
         2. Cmd 100/0: Get protocol version
         3. Cmd 100/5: Set max packet (if version > 1)
-        4. Cmd 100/2: Init session with total bytes
+        4. Cmd 100/2: Init session with total bytes (sent later in flasher.py)
         """
         self.log("Initializing connection...")
         
@@ -154,6 +155,7 @@ class DownloadEngine:
         
         # NOTE: 100/2 (init session with total bytes) is sent LATER
         # in flasher.py after firmware is loaded and total is known
+        # NOTE: 100/3 (lock information) is also sent in flasher.py if option_lock is enabled
         
         self.log("✓ Connection initialized (total bytes sent later)")
         return True
@@ -851,6 +853,271 @@ class DownloadEngine:
         buf = bytearray(0x800)  # 2048 bytes
         struct.pack_into("<III", buf, 0, cmd, sub, param)
         return self.usb_device.write(bytes(buf[:self.packet_size]))
+    
+    def enumerate_command_params(self, cmd: int, sub: int, param_range: range = None, 
+                                 probe_timeout: float = 2.0, verbose: bool = True) -> dict:
+        """
+        Enumerate which parameter values a device accepts for a given command.
+        
+        This tries different parameter values and records which ones the device
+        accepts (responds with matching command ID) vs rejects (error/timeout).
+        
+        Args:
+            cmd: Command ID (e.g., 100)
+            sub: Sub-command ID (e.g., 3)
+            param_range: Range of parameter values to test (default: 0-255)
+            probe_timeout: Timeout per probe in seconds (default: 2.0s)
+            verbose: If True, log each attempt (default: True)
+        
+        Returns:
+            dict with keys:
+                - 'accepted': list of param values that device accepted
+                - 'rejected': list of param values that device rejected (error response)
+                - 'timeout': list of param values that timed out (no response)
+                - 'unexpected': list of param values with unexpected responses
+        """
+        if param_range is None:
+            param_range = range(256)  # Default: 0-255
+        
+        results = {
+            'accepted': [],
+            'rejected': [],
+            'timeout': [],
+            'unexpected': []
+        }
+        
+        total = len(param_range)
+        self.log(f"Enumerating parameters for command {cmd}/{sub} (testing {total} values)...")
+        
+        for idx, param in enumerate(param_range):
+            if verbose and (idx % 16 == 0 or idx == total - 1):
+                self.log(f"  Testing param={param} ({idx+1}/{total})...")
+            
+            # Pack command
+            buf = bytearray(0x800)
+            struct.pack_into("<III", buf, 0, cmd, sub, param)
+            
+            try:
+                written = self.usb_device.write(bytes(buf[:self.packet_size]))
+                if written != self.packet_size:
+                    if verbose:
+                        self.log(f"    ✗ Write failed for param={param}")
+                    results['timeout'].append(param)
+                    continue
+                
+                # Try to read response
+                try:
+                    resp = self.usb_device.read(64, timeout=probe_timeout)
+                    if resp and len(resp) >= 8:
+                        resp_cmd, resp_data = struct.unpack("<II", resp[:8])
+                        
+                        # Check response
+                        if resp_cmd == cmd:
+                            # Device accepted this parameter
+                            results['accepted'].append(param)
+                            if verbose:
+                                self.log(f"    ✓ param={param} ACCEPTED (data={resp_data})")
+                        elif resp_cmd == 0xFFFFFFFF or resp_cmd == -1:
+                            # Device rejected with error
+                            results['rejected'].append(param)
+                            if verbose:
+                                self.log(f"    ✗ param={param} REJECTED (error -1)")
+                        else:
+                            # Unexpected response
+                            results['unexpected'].append((param, resp_cmd, resp_data))
+                            if verbose:
+                                self.log(f"    ? param={param} UNEXPECTED (cmd={resp_cmd}, data={resp_data})")
+                    else:
+                        # Partial response
+                        results['timeout'].append(param)
+                        if verbose:
+                            self.log(f"    ? param={param} TIMEOUT (partial response)")
+                except OdinTimeoutError:
+                    # No response - device doesn't support this parameter
+                    results['timeout'].append(param)
+                    if verbose and idx % 16 == 0:
+                        self.log(f"    ? param={param} TIMEOUT (no response)")
+                except Exception as e:
+                    results['timeout'].append(param)
+                    if verbose:
+                        self.log(f"    ✗ param={param} ERROR: {e}")
+            except Exception as e:
+                results['timeout'].append(param)
+                if verbose:
+                    self.log(f"    ✗ param={param} ERROR: {e}")
+        
+        # Summary
+        self.log(f"\nEnumeration complete for {cmd}/{sub}:")
+        self.log(f"  ✓ Accepted: {len(results['accepted'])} params {results['accepted'][:20]}{'...' if len(results['accepted']) > 20 else ''}")
+        self.log(f"  ✗ Rejected: {len(results['rejected'])} params {results['rejected'][:20]}{'...' if len(results['rejected']) > 20 else ''}")
+        self.log(f"  ? Timeout: {len(results['timeout'])} params")
+        if results['unexpected']:
+            self.log(f"  ? Unexpected: {len(results['unexpected'])} params")
+            for param, resp_cmd, resp_data in results['unexpected'][:5]:
+                self.log(f"      param={param}: cmd={resp_cmd}, data={resp_data}")
+        
+        return results
+    
+    def probe_lock_command_support(self, mode: str = "bypass", probe_timeout: float = 2.0) -> bool:
+        """
+        Probe if device supports lock/unlock command (100/3) without waiting full timeout.
+        
+        This sends the command with a short timeout to quickly determine if the device
+        responds. Useful for checking support before attempting the full command.
+        
+        Args:
+            mode: "bypass" (param=1) or "unlock" (param=0)
+            probe_timeout: Timeout in seconds for probe (default 2.0s)
+        
+        Returns:
+            True if device responds (supports command), False if timeout/not supported
+        """
+        if mode not in ["bypass", "unlock"]:
+            raise ValueError(f"Invalid mode '{mode}', must be 'bypass' or 'unlock'")
+        
+        param = 1 if mode == "bypass" else 0
+        action = "Bypass/Lock" if mode == "bypass" else "OEM Unlock"
+        
+        self.log(f"Probing {action} support (100/3, param={param}, timeout={probe_timeout}s)...")
+        
+        # Pack command exactly as odin4.c
+        buf = bytearray(0x800)
+        struct.pack_into("<III", buf, 0, 100, 3, param)
+        
+        written = self.usb_device.write(bytes(buf[:self.packet_size]))
+        if written != self.packet_size:
+            return False
+        
+        # Try to read response with short timeout
+        try:
+            resp = self.usb_device.read(64, timeout=probe_timeout)
+            if resp and len(resp) >= 8:
+                resp_cmd, _ = struct.unpack("<II", resp[:8])
+                # Device responded - check if it's a valid response
+                if resp_cmd == 100:
+                    self.log(f"  ✓ Device supports {action} command")
+                    return True
+                elif resp_cmd == 0xFFFFFFFF or resp_cmd == -1:
+                    self.log(f"  ✗ Device rejected {action} command")
+                    return False
+                else:
+                    self.log(f"  ? Device responded with unexpected cmd={resp_cmd}")
+                    return False
+            else:
+                # Partial response - device might be processing
+                self.log(f"  ? Partial response ({len(resp) if resp else 0} bytes)")
+                return False
+        except OdinTimeoutError:
+            # No response within probe timeout - device likely doesn't support it
+            self.log(f"  ✗ No response (device may not support {action})")
+            return False
+        except Exception as e:
+            self.log(f"  ✗ Probe error: {e}")
+            return False
+    
+    def send_lock_command(self, mode: str = "bypass"):
+        """
+        Send lock/unlock command (100/3) - odin4.c line 14390
+        
+        EXACT implementation from odin4.c:
+        - Packs: cmd=100, sub=3, param at offset 8
+        - Success if response cmd == request cmd (100)
+        
+        Modes:
+          - "bypass" (param=1): Bypass verification for this session (option_lock in odin4)
+            ✓ Verified: odin4.c uses this (line 14390)
+          - "unlock" (param=0): OEM bootloader unlock command
+            ⚠ UNVERIFIED: odin4.c never uses param=0, implementation is based on protocol structure
+        
+        Returns True if accepted, False if rejected.
+        """
+        if mode not in ["bypass", "unlock"]:
+            raise ValueError(f"Invalid mode '{mode}', must be 'bypass' or 'unlock'")
+        
+        param = 1 if mode == "bypass" else 0
+        action = "Bypass/Lock" if mode == "bypass" else "OEM Unlock"
+        
+        self.log(f"Sending {action} command (100/3, param={param})...")
+        
+        # Pack EXACTLY as odin4.c requestAndResponse does (line 14092-14096):
+        # memset(v17, 0, 0x800u);
+        # v17[0] = a2;  // cmd = 100
+        # v17[1] = a3;  // sub = 3
+        # v17[2] = a5;  // param = 1 (bypass) or 0 (unlock)
+        buf = bytearray(0x800)
+        struct.pack_into("<III", buf, 0, 100, 3, param)
+        
+        written = self.usb_device.write(bytes(buf[:self.packet_size]))
+        if written != self.packet_size:
+            self.log(f"Write failed: {written} != {self.packet_size}")
+            return False
+        
+        # Read response EXACTLY as odin4.c requestAndResponse (line 14110-14124):
+        # - Request 64 bytes, but must receive exactly 8 bytes
+        # - Timeout: 60000ms (60 seconds) - line 14116
+        # - Retry up to 2 times if read returns 0 bytes (line 14109-14121)
+        # - v11 = bytes read, must be exactly 8 (line 14123)
+        timeout = 60  # 60000ms = 60 seconds (line 14116)
+        max_retries = 2  # v10 = 2 (line 14109)
+        bytes_read = 0
+        resp = None
+        
+        for retry in range(max_retries):
+            try:
+                self.log(f"  Reading response (attempt {retry + 1}/{max_retries}, timeout={timeout}s)...")
+                # Request 64 bytes but we only need 8 (line 14115)
+                resp = self.usb_device.read(64, timeout=timeout)
+                bytes_read = len(resp) if resp else 0
+                
+                # odin4.c line 14118: if ( v11 ) break;
+                # v11 is the return value (bytes read), so if > 0, break
+                if bytes_read > 0:
+                    self.log(f"  Read {bytes_read} bytes")
+                    break
+                else:
+                    # odin4.c line 14120: if ( !--v10 ) return 0;
+                    # Retry if read returned 0 bytes
+                    self.log(f"  Read returned 0 bytes, retrying...")
+                    if retry == max_retries - 1:
+                        self.log("✗ No response after retries")
+                        return False
+                    continue
+                    
+            except OdinTimeoutError:
+                # Timeout means device didn't respond - some devices don't support 100/3
+                self.log(f"  Read timed out after {timeout}s (device may not support this command)")
+                return False
+            except (OdinUSBError, Exception) as e:
+                self.log(f"✗ Read error: {e}")
+                return False
+        
+        # odin4.c line 14123-14124: if ( v11 != 8 ) return 0;
+        # Must receive exactly 8 bytes
+        if bytes_read != 8:
+            self.log(f"✗ Invalid response size: expected exactly 8 bytes, got {bytes_read}")
+            return False
+        
+        # Parse response (line 14127-14138)
+        # v13 = response command (first 4 bytes, signed int)
+        # v14 = response data (next 4 bytes, not checked for 100/3)
+        resp_cmd, resp_data = struct.unpack("<II", resp[:8])
+        self.log(f"  Response: cmd={resp_cmd}, data={resp_data}")
+        
+        # odin4.c success check (line 14127):
+        # if ( v13 == -1 || a2 != v13 ) return 0;
+        # return 1;
+        # v13 is signed int, so -1 is 0xFFFFFFFF as unsigned
+        if resp_cmd == 0xFFFFFFFF or resp_cmd == -1:
+            self.log(f"✗ {action} command returned error (-1)")
+            return False
+        
+        if resp_cmd != 100:  # a2 != v13
+            self.log(f"✗ {action} command rejected: expected cmd=100, got cmd={resp_cmd}")
+            return False
+        
+        # Success! Response cmd matches request cmd (line 14139)
+        self.log(f"✓ {action} command accepted")
+        return True
     
     def reboot_device(self, to_download_mode: bool = False) -> bool:
         """
