@@ -1,866 +1,606 @@
 """
-Download Engine - Firmware flashing engine
+Main Odin Flasher
 
-Implements the exact Odin protocol from odin4.c decompiled source.
+High-level API for firmware flashing operations.
 """
 
-import os
-import struct
 import time
-from typing import Optional, Callable
-from dataclasses import dataclass
+import struct
+from typing import Optional, Callable, List, Dict
 
 from .usb_device import UsbDevice, DeviceInfo
-from .firmware import FirmwareData, FirmwareItem
+from .download_engine import DownloadEngine, DownloadProgress
+from .firmware import FirmwareParser, FirmwareData
+from .pit import PitParser, PitData
+from .manifest import ManifestParser, ManifestInfo
 from .exceptions import (
-    OdinProtocolError,
+    OdinException,
     OdinConnectionError,
-    OdinTimeoutError,
-    OdinUSBError
-)
-from .constants import (
-    OdinCommand,
-    TIMEOUT_HANDSHAKE,
-    TIMEOUT_TRANSFER,
-    PROGRESS_UPDATE_INTERVAL
+    OdinFirmwareError
 )
 
 
-@dataclass
-class DownloadProgress:
-    """Download/flashing progress information"""
-    current_item: int = 0
-    total_items: int = 0
-    current_bytes: int = 0
-    total_bytes: int = 0
-    current_file: str = ""
-    percentage: float = 0.0
-    speed_bps: float = 0.0
-    
-    def __repr__(self) -> str:
-        return f"DownloadProgress({self.percentage:.1f}%, {self.current_file})"
-
-
-class DownloadEngine:
+class OdinFlasher:
     """
-    Firmware download/flashing engine
+    Main Odin flasher class
     
-    Exact implementation from odin4.c decompiled source code.
+    Provides high-level API for firmware flashing operations.
     """
     
-    def __init__(self, usb_device: UsbDevice, verbose: bool = False):
-        self.usb_device = usb_device
+    def __init__(self, verbose: bool = False, bypass_verification: bool = False):
         self.verbose = verbose
+        self.bypass_verification = bypass_verification
+        self.usb_device: Optional[UsbDevice] = None
+        self.download_engine: Optional[DownloadEngine] = None
+        self.firmware_parser = FirmwareParser(verbose=verbose, bypass_verification=bypass_verification)
+        self.pit_parser = PitParser(verbose=verbose)
+        self.manifest_parser = ManifestParser(verbose=verbose)
         self.device_info: Optional[DeviceInfo] = None
-        self.progress = DownloadProgress()
-        self.progress_callback: Optional[Callable[[DownloadProgress], None]] = None
-        self.packet_size = 1024  # Need 1024 or it will fail binary check
-        self._protocol_version = 2  # Will be set during initialize_connection
-        self.file_transfer_packet_size = 131072  # Data block size: 128KB default, 1MB if supported
-        self._last_progress_time = 0.0
-        self._last_progress_bytes = 0
+        self.is_connected = False
     
     def log(self, message: str):
         """Print log message if verbose"""
         if self.verbose:
-            print(f"[DownloadEngine] {message}")
+            print(f"[OdinFlasher] {message}")
     
-    def set_progress_callback(self, callback: Callable[[DownloadProgress], None]):
-        """Set progress callback function"""
-        self.progress_callback = callback
-    
-    def _update_progress(self):
-        """Update and notify progress"""
-        # Calculate percentage
-        if self.progress.total_bytes > 0:
-            self.progress.percentage = (self.progress.current_bytes / self.progress.total_bytes) * 100.0
-        else:
-            self.progress.percentage = 0.0
-        
-        # Calculate speed (bytes per second)
-        current_time = time.time()
-        if self._last_progress_time > 0:
-            time_delta = current_time - self._last_progress_time
-            if time_delta > 0:
-                bytes_delta = self.progress.current_bytes - self._last_progress_bytes
-                self.progress.speed_bps = bytes_delta / time_delta
-        
-        self._last_progress_time = current_time
-        self._last_progress_bytes = self.progress.current_bytes
-        
-        # Call progress callback
-        if self.progress_callback is not None:
-            self.progress_callback(self.progress)
-    
-    def handshake(self) -> bool:
+    def _get_decompressed_size(self, item) -> int:
         """
-        Handshake with device (from odin4.c line 12670)
+        Get decompressed size efficiently without loading entire file into memory.
         
-        Send: "ODIN" (4 bytes)
-        Receive: "LOKE" (4 bytes)
-        Timeout: 60000ms (60 seconds)
-        """
-        self.log("Handshake...")
-        
-        # Send "ODIN" (odin4.c line 12670: timeout=60000)
-        if self.usb_device.write(b"ODIN") != 4:
-            return False
-        
-        # Receive response (odin4.c line 12675: timeout=60000)
-        resp = self.usb_device.read(64, timeout=60)
-        if len(resp) < 4:
-            return False
-        
-        # Check for "LOKE"
-        if resp[0] == 76 and resp[1:3] == b'\x4F\x4B' and resp[3] == 69:
-            self.log("✓ Handshake OK")
-            return True
-        
-        return False
-    
-    def initialize_connection(self, total_bytes: int = 0) -> bool:
-        """
-        Initialize connection (from odin4.c line 14336-14379)
-        
-        Sequence:
-        1. Handshake
-        2. Cmd 100/0: Get protocol version
-        3. Cmd 100/5: Set max packet (if version > 1)
-        4. Cmd 100/2: Init session with total bytes (sent later in flasher.py)
-        """
-        self.log("Initializing connection...")
-        
-        if not self.handshake():
-            return False
-        
-        # Request and response helper (odin4.c requestAndResponse)
-        def req_resp(cmd, sub, param):
-            buf = bytearray(0x800)
-            struct.pack_into("<III", buf, 0, cmd, sub, param)
-            self.usb_device.write(bytes(buf[:self.packet_size]))
-            resp = self.usb_device.read(64, timeout=60)  # odin4.c line 12847: 60000ms
-            if len(resp) >= 8:
-                return struct.unpack("<II", resp[:8])
-            return (0, 0)
-        
-        # Get protocol version
-        cmd, data_resp = req_resp(100, 0, 4)
-        version = (data_resp >> 16) & 0xFFFF
-        self.log(f"Protocol version: {version}")
-        self._protocol_version = version  # Store for later use
-        
-        # Set max packet if version > 1
-        if version > 1:
-            req_resp(100, 5, 0x100000)
-        
-        # NOTE: 100/2 (init session with total bytes) is sent LATER
-        # in flasher.py after firmware is loaded and total is known
-        # NOTE: 100/3 (lock information) is also sent in flasher.py if option_lock is enabled
-        
-        self.log("✓ Connection initialized (total bytes sent later)")
-        return True
-    
-    def get_device_info(self) -> DeviceInfo:
-        """Get device info"""
-        device_info = self.usb_device.device_info or DeviceInfo(0, 0)
-        device_info.protocol_version = self._protocol_version  # Use actual detected version
-        self.device_info = device_info
-        return device_info
-    
-    def send_pit_info(self) -> bool:
-        """
-        Send PIT info to device (from odin4.c line 14405-14441)
-        
-        For protocol v2/v3, this MUST be called before receivePitInfo
-        to make the device receptive.
-        """
-        self.log("Sending PIT info...")
-        
-        # From line 14415: if no PIT data, just return success
-        # But we still need to signal readiness to the device
-        # Check if this sends any command even without PIT...
-        # Looking at line 14419-14428, it sends commands only if PIT exists
-        # So for now, just return True to continue the flow
-        
-        self.log("✓ PIT info sent (no-op without PIT data)")
-        return True
-    
-    def receive_pit_data(self) -> bytes:
-        """
-        Receive PIT from device (from odin4.c line 14476-14600)
-        
-        EXACT implementation - uses command 101 (NOT 105!)
-        """
-        self.log("Requesting PIT from device...")
-        
-        # Step 1: requestAndResponse(this, 101, 1, &v19, 0) - line 14529
-        # Get PIT size using command 101/1
-        buf = bytearray(0x800)
-        struct.pack_into("<III", buf, 0, 101, 1, 0)
-        
-        self.usb_device.write(bytes(buf[:self.packet_size]))
-        
-        # Read response with retry
-        resp = None
-        for retry in range(2):
-            resp = self.usb_device.read(64, timeout=60)
-            if resp and len(resp) >= 8:
-                break
-        
-        if not resp or len(resp) < 8:
-            raise OdinProtocolError("PIT request timeout")
-        
-        resp_cmd, resp_data = struct.unpack("<II", resp[:8])
-        
-        if resp_cmd != 101:
-            raise OdinProtocolError(f"PIT cmd={resp_cmd}")
-        
-        pit_size = resp_data
-        
-        self.log(f"PIT size: {pit_size} bytes")
-        
-        # Sanity check (line 14547)
-        if pit_size == 0 or pit_size > 0x100000:
-            raise OdinProtocolError(f"Invalid PIT size: {pit_size}")
-        
-        # Step 2: Read PIT in 500-byte chunks (line 14552-14568)
-        pit_data = bytearray()
-        counter = 0
-        remaining = pit_size
-        
-        while remaining > 0:
-            # request(this, 101, 2, counter) - line 14555
-            buf = bytearray(0x800)
-            struct.pack_into("<III", buf, 0, 101, 2, counter)
-            self.usb_device.write(bytes(buf[:self.packet_size]))
-            
-            # Read chunk
-            read_size = min(500, remaining)
-            chunk = self.usb_device.read(read_size, timeout=60)
-            
-            if len(chunk) == 0:
-                break
-            
-            pit_data.extend(chunk)
-            remaining -= len(chunk)
-            counter += 1
-        
-        self.log(f"Read {len(pit_data)} bytes in {counter} chunks")
-        
-        # Step 3: Finalize (line 14594) - command 101/3
-        buf = bytearray(0x800)
-        struct.pack_into("<III", buf, 0, 101, 3, 0)
-        self.usb_device.write(bytes(buf[:self.packet_size]))
-        resp = self.usb_device.read(64, timeout=60)  # odin4.c: 60000ms
-        
-        if len(pit_data) != pit_size:
-            self.log(f"Warning: PIT size mismatch: {len(pit_data)}/{pit_size}")
-        
-        self.log(f"✓ PIT received")
-        return bytes(pit_data)
-    
-    def _stream_decompress(self, item: FirmwareItem) -> tuple:
-        """
-        Stream decompress compressed data to avoid memory exhaustion.
-        
-        Returns:
-            tuple: (decompressed_data_or_file, total_size)
-            
-        For very large files (>1GB compressed), decompresses to a temporary file.
-        For smaller files, decompresses to memory.
+        Tries to extract size from compression headers/footers when possible,
+        otherwise uses streaming decompression to count bytes.
         """
         import io
-        import tempfile
+        import struct
         
-        compressed_data = item.data
         compression_type = item.info.compression_type
+        compressed_data = item.data
         
-        # For very large compressed files, use temp file to avoid OOM
-        # Threshold: 1GB compressed (likely 3-5GB decompressed)
-        USE_TEMP_FILE_THRESHOLD = 1 * 1024 * 1024 * 1024
-        use_temp_file = len(compressed_data) > USE_TEMP_FILE_THRESHOLD
-        
-        if use_temp_file:
-            self.log(f"  Large file detected ({len(compressed_data)/(1024**3):.2f} GB compressed)")
-            self.log(f"  Using temporary file to avoid memory exhaustion...")
-        
-        # Decompression chunk size (decompress in 64MB chunks)
-        DECOMPRESS_CHUNK_SIZE = 64 * 1024 * 1024
-        
-        if compression_type == "lz4":
-            import lz4.frame
-            
-            # LZ4 streaming decompression
-            self.log(f"  Starting LZ4 streaming decompression...")
-            
-            # Try using LZ4FrameDecompressor which provides true streaming
+        if compression_type == "gzip":
+            # GZIP stores uncompressed size in last 4 bytes (ISIZE field)
+            # Note: This is modulo 2^32, so only accurate for files < 4GB
             try:
-                from lz4.frame import LZ4FrameDecompressor
-                
-                decompressor = LZ4FrameDecompressor()
-                total_decompressed = 0
-                
-                # Process compressed data in chunks
-                compressed_offset = 0
-                chunk_size = 2 * 1024 * 1024  # Read 2MB of compressed data at a time
-                
-                self.log(f"  Using LZ4FrameDecompressor for memory-efficient streaming...")
-                
-                if use_temp_file:
-                    # Write to temporary file to avoid holding everything in memory
-                    temp_fd, temp_path = tempfile.mkstemp(suffix='.decompressed', prefix='pyodin_')
-                    self.log(f"  Decompressing to temporary file: {temp_path}")
+                if len(compressed_data) >= 4:
+                    # Last 4 bytes contain uncompressed size (little-endian)
+                    isize = struct.unpack('<I', compressed_data[-4:])[0]
                     
-                    with os.fdopen(temp_fd, 'w+b') as temp_file:
-                        while compressed_offset < len(compressed_data):
-                            end_offset = min(compressed_offset + chunk_size, len(compressed_data))
-                            compressed_chunk = compressed_data[compressed_offset:end_offset]
-                            
-                            try:
-                                decompressed_chunk = decompressor.decompress(compressed_chunk)
-                                
-                                if decompressed_chunk:
-                                    temp_file.write(decompressed_chunk)
-                                    total_decompressed += len(decompressed_chunk)
-                                    
-                                    if total_decompressed % (200 * 1024 * 1024) < len(decompressed_chunk):
-                                        self.log(f"    Decompressed: {total_decompressed / (1024*1024):.1f} MB")
-                                
-                                compressed_offset = end_offset
-                                
-                            except Exception as e:
-                                if "End of frame" in str(e) or not compressed_chunk:
-                                    break
-                                raise
-                        
-                        # Get remaining data
-                        try:
-                            remaining = decompressor.flush()
-                            if remaining:
-                                temp_file.write(remaining)
-                                total_decompressed += len(remaining)
-                        except:
-                            pass
-                        
-                        temp_file.flush()
-                        
-                        self.log(f"  Total decompressed: {total_decompressed / (1024*1024):.1f} MB")
-                        self.log(f"  Keeping data in temporary file to avoid loading into memory")
-                    
-                    # Return the temp file path instead of data
-                    # The transmit_data function will read from the file in chunks
-                    return temp_path, total_decompressed
-                else:
-                    # Small file - keep in memory
-                    decompressed_chunks = []
-                    
-                    while compressed_offset < len(compressed_data):
-                        end_offset = min(compressed_offset + chunk_size, len(compressed_data))
-                        compressed_chunk = compressed_data[compressed_offset:end_offset]
-                        
-                        try:
-                            decompressed_chunk = decompressor.decompress(compressed_chunk)
-                            
-                            if decompressed_chunk:
-                                decompressed_chunks.append(decompressed_chunk)
-                                total_decompressed += len(decompressed_chunk)
-                            
-                            compressed_offset = end_offset
-                            
-                        except Exception as e:
-                            if "End of frame" in str(e) or not compressed_chunk:
-                                break
-                            raise
-                    
-                    # Get remaining data
-                    try:
-                        remaining = decompressor.flush()
-                        if remaining:
-                            decompressed_chunks.append(remaining)
-                            total_decompressed += len(remaining)
-                    except:
-                        pass
-                    
-                    data = b''.join(decompressed_chunks)
-                    return data, len(data)
-                
-            except ImportError:
-                self.log(f"  LZ4FrameDecompressor not available, trying fallback...")
-                
-                # Fallback: Use direct decompression
-                # For large files, this WILL cause OOM, but there's no alternative
-                self.log(f"  WARNING: No streaming LZ4 support available!")
-                self.log(f"  Install newer python-lz4: pip install --upgrade python-lz4")
-                self.log(f"  Attempting direct decompression - may cause out of memory...")
-                
-                try:
-                    data = lz4.frame.decompress(compressed_data)
-                    return data, len(data)
-                except MemoryError:
-                    raise OdinProtocolError(
-                        f"Out of memory decompressing {item.filename}. "
-                        f"Install python-lz4 >= 3.0.0 for streaming support: "
-                        f"pip install --upgrade python-lz4"
-                    )
-        
-        elif compression_type == "gzip":
+                    # If size seems reasonable (not wrapped around), use it
+                    # Otherwise fall back to streaming
+                    if isize > 0 and isize < 10 * 1024 * 1024 * 1024:  # < 10GB
+                        self.log(f"  GZIP size from footer: {isize / (1024*1024):.1f} MB")
+                        return isize
+            except:
+                pass
+            
+            # Fallback: stream and count
+            self.log(f"  Calculating GZIP size via streaming...")
             import gzip
-            
-            # GZIP streaming decompression
-            self.log(f"  Starting GZIP streaming decompression...")
-            decompressed_chunks = []
-            total_decompressed = 0
-            
-            # Create gzip decompressor
+            total_size = 0
             compressed_stream = io.BytesIO(compressed_data)
             
             with gzip.GzipFile(fileobj=compressed_stream, mode='rb') as gz:
+                chunk_size = 64 * 1024 * 1024  # 64MB chunks
                 while True:
-                    # Read decompressed data in chunks
-                    chunk = gz.read(DECOMPRESS_CHUNK_SIZE)
+                    chunk = gz.read(chunk_size)
                     if not chunk:
                         break
+                    total_size += len(chunk)
                     
-                    decompressed_chunks.append(chunk)
-                    total_decompressed += len(chunk)
-                    
-                    # Log progress every 100MB
-                    if total_decompressed % (100 * 1024 * 1024) < len(chunk):
-                        self.log(f"    Decompressed: {total_decompressed / (1024*1024):.1f} MB")
+                    # Log progress for large files
+                    if total_size % (500 * 1024 * 1024) < chunk_size:
+                        self.log(f"    Calculated size so far: {total_size / (1024*1024):.1f} MB")
             
-            # Join all decompressed chunks
-            self.log(f"  Joining {len(decompressed_chunks)} decompressed chunks...")
-            data = b''.join(decompressed_chunks)
-            return data, len(data)
+            return total_size
         
-        else:
-            self.log(f"  WARNING: Unknown compression type '{compression_type}'")
-            return item.data, len(item.data)
-    
-    def transmit_data(self, item: FirmwareItem, compressed: bool = False) -> bool:
-        """
-        Transmit firmware data (from odin4.c line 14656-14797)
-        
-        EXACT implementation of DownloadEngine::transmitData
-        Uses streaming decompression to avoid memory exhaustion.
-        """
-        self.log(f"Transmitting: {item.filename}")
-        
-        # Load data if lazy-loaded
-        if item._lazy_load or len(item.data) == 0:
-            self.log(f"  Loading data from TAR...")
-            item.load_data()
-        
-        # Handle compression with streaming decompression
-        temp_file_path = None
-        data_file = None
-        
-        if item.info.is_compressed:
-            self.log(f"  File is compressed ({item.info.compression_type}): {len(item.data)} bytes")
+        elif compression_type == "lz4":
+            # LZ4 frame format MAY include content size in frame descriptor
+            try:
+                import lz4.frame
+                
+                # Try to read frame info
+                if len(compressed_data) >= 7:
+                    # LZ4 frame header: magic(4) + FLG(1) + BD(1) + ...
+                    flg = compressed_data[4]
+                    content_size_flag = (flg >> 3) & 0x01
+                    
+                    if content_size_flag:
+                        # Content size is present at offset 6 (8 bytes, little-endian)
+                        if len(compressed_data) >= 14:
+                            content_size = struct.unpack('<Q', compressed_data[6:14])[0]
+                            self.log(f"  LZ4 size from header: {content_size / (1024*1024):.1f} MB")
+                            return content_size
+            except:
+                pass
+            
+            # Fallback: stream and count using LZ4 streaming API
+            self.log(f"  Calculating LZ4 size via streaming...")
+            import lz4.frame
             
             try:
-                # Use streaming decompression to avoid loading entire file into memory
-                data_or_path, file_size = self._stream_decompress(item)
+                # Try streaming decompression
+                dctx = lz4.frame.create_decompression_context()
+                total_size = 0
+                compressed_offset = 0
+                chunk_size = 1 * 1024 * 1024  # 1MB compressed chunks
                 
-                # Check if we got a file path (large file) or bytes (small file)
-                if isinstance(data_or_path, str):
-                    # Large file - decompressed to temp file
-                    temp_file_path = data_or_path
-                    data_file = open(temp_file_path, 'rb')
-                    data = None  # No in-memory data
-                    self.log(f"  Decompressed: {len(item.data)} → {file_size} bytes (using temp file)")
-                else:
-                    # Small file - data in memory
-                    data = data_or_path
-                    self.log(f"  Decompressed: {len(item.data)} → {file_size} bytes (in memory)")
-            except Exception as e:
-                self.log(f"  ERROR: Decompression failed: {e}")
-                raise OdinProtocolError(f"Failed to decompress {item.filename}: {e}")
-        else:
-            data = item.data
-            file_size = len(data)
-            self.log(f"  Uncompressed: {file_size} bytes")
-        offset = 0
-        
-        self.progress.current_file = item.filename
-        self.progress.total_bytes = file_size
-        
-        try:
-            # Send FileTransferPacket (102/0) - use 1024 byte packets
-            self.log(f"  Activating file transfer (102/0)...")
-            buf = bytearray(1024)
-            struct.pack_into("<III", buf, 0, 102, 0, 0)
-            self.usb_device.write(bytes(buf[:self.packet_size]))
-            resp = self.usb_device.read(64, timeout=60)
-            if len(resp) < 8:
-                self.log(f"  ERROR: File transfer activation timeout")
-                return False
-            resp_cmd, resp_data = struct.unpack("<II", resp[:8])
-            if resp_cmd != 102:
-                self.log(f"  ERROR: File transfer activation rejected, cmd={resp_cmd}, data={resp_data}")
-                return False
-            self.log(f"  File transfer activated")
-            
-            # Main loop - EXACTLY as odin4.c line 14762
-            # Each chunk: 102/0, 102/2, data, 102/3
-            while True:
-                # Check if done FIRST (line 14763)
-                remaining = file_size - offset
-                if remaining <= 0:
-                    self.log(f"  All data sent, exiting loop")
-                    break
-                
-                # Get chunk size (max 30MB of compressed data)
-                chunk_size = min(remaining, 0x1E00000)
-                self.log(f"  Sequence {offset//0x1E00000}: offset={offset}, chunk={chunk_size}")
-                
-                # Begin sequence transfer (102/2) - use 1024 byte packets
-                buf = bytearray(1024)
-                struct.pack_into("<III", buf, 0, 102, 2, chunk_size)
-                
-                self.usb_device.write(bytes(buf[:self.packet_size]))
-                resp = self.usb_device.read(64, timeout=60)
-                if len(resp) < 8:
-                    self.log(f"ERROR: Sequence begin timeout")
-                    return False
-                resp_cmd, resp_data = struct.unpack("<II", resp[:8])
-                if resp_cmd != 102:
-                    self.log(f"ERROR: Sequence begin rejected, cmd={resp_cmd}")
-                    return False
-                self.log(f"  Sequence begin accepted")
-                
-                # No separate size command - the sequence size is already in 102/2 above
-                # Give device a moment to prepare for data
-                time.sleep(0.1)
-                
-                # Send data blocks (compressed files send COMPRESSED data)
-                self.log(f"  Sending {chunk_size} bytes in {self.file_transfer_packet_size} byte blocks...")
-                chunk_offset = 0
-                block_count = 0
-                while chunk_offset < chunk_size:
-                    block_size = min(self.file_transfer_packet_size, chunk_size - chunk_offset)
+                while compressed_offset < len(compressed_data):
+                    end_offset = min(compressed_offset + chunk_size, len(compressed_data))
+                    compressed_chunk = compressed_data[compressed_offset:end_offset]
                     
-                    # Read block from either memory or file
-                    if data_file is not None:
-                        # Reading from file
-                        data_file.seek(offset + chunk_offset)
-                        block = data_file.read(block_size)
-                    else:
-                        # Reading from memory
-                        block = data[offset + chunk_offset:offset + chunk_offset + block_size]
-                    
-                    # Pad to full packet size
-                    if len(block) < self.file_transfer_packet_size:
-                        block += b'\x00' * (self.file_transfer_packet_size - len(block))
-                    
-                    # CRITICAL: Send empty transfer before each block (except first)
-                    if block_count > 0:
-                        self.log(f"    Block {block_count}: sending empty transfer...")
-                        try:
-                            # Send 0-byte transfer for device synchronization
-                            self.usb_device.write(b'', timeout=1)
-                        except:
-                            pass  # ignores failures of empty transfers
-                    
-                    self.log(f"    Block {block_count}: sending {len(block)} bytes (original size={block_size})")
-                    
-                    # Send data block
-                    written = self.usb_device.write(block, timeout=60)
-                    self.log(f"    Block {block_count}: wrote {written} bytes")
-                    if written != self.file_transfer_packet_size:
-                        self.log(f"    ERROR: Expected to write {self.file_transfer_packet_size} bytes, wrote {written}")
-                        return False
+                    try:
+                        decompressed_chunk, bytes_read = lz4.frame.decompress_chunk(
+                            dctx, compressed_chunk
+                        )
                         
-                    resp = self.usb_device.read(64, timeout=60)
-                    self.log(f"    Block {block_count}: got response {len(resp)} bytes")
-                    if len(resp) != 8:
-                        self.log(f"    ERROR: Expected 8-byte response, got {len(resp)} bytes")
-                        return False
-                    
-                    chunk_offset += block_size
-                    block_count += 1
-                    self.progress.current_bytes = offset + chunk_offset
-                    self._update_progress()
-                
-                self.log(f"  Sent {block_count} blocks, total {chunk_offset} bytes")
-                
-                # Finalize chunk (line 14780-14789)
-                # From source: HIDWORD(v20) = sub_7C4C0(v22)
-                # sub_7C4C0 returns: *(a1 + 528) <= 0  (true when no more data)
-                remaining_after = file_size - (offset + chunk_size)
-                completion_status = 1 if remaining_after <= 0 else 0
-                
-                # Calculate ACTUAL bytes sent
-                # sequenceEffectiveByteCount accounts for partial last block WITHOUT padding
-                # Last block might be padded, but we report only actual data bytes
-                actual_bytes_in_sequence = chunk_offset  # This is the unpadded size
-                
-                # Build 102/3 packet - EndPhoneFileTransferPacket
-                buf = bytearray(1024)  # use 1024 byte packets!
-                struct.pack_into("<II", buf, 0, 102, 3)  # cmd=102, sub=3
-                
-                struct.pack_into("<IIIIII", buf, 8,
-                               0,                        # destination (0=Phone)
-                               actual_bytes_in_sequence, # sequenceByteCount (ACTUAL unpadded bytes)
-                               0,                        # unknown1
-                               item.info.device_type,    # deviceType (from PIT)
-                               item.info.partition_id,   # fileIdentifier (partition ID)
-                               completion_status)        # endOfFile (1=last, 0=more)
-                
-                self.log(f"    Finalize: size={chunk_size}, part_id={item.info.partition_id}, dev_type={item.info.device_type}, flags={item.info.transfer_flags}, status={completion_status}")
-                self.log(f"    FULL PACKET HEX (first 64 bytes):")
-                hex_str = buf[:64].hex()
-                for i in range(0, len(hex_str), 32):
-                    self.log(f"      {i//2:04d}: {hex_str[i:i+32]}")
-                
-                self.log(f"    Sending empty transfer before 102/3...")
-                try:
-                    self.usb_device.write(b'', timeout=1)
-                except:
-                    pass
-                
-                # Write exactly self.packet_size bytes (line 14268)
-                self.usb_device.write(bytes(buf[:self.packet_size]))
-                
-                self.log(f"    Sending empty transfer after 102/3...")
-                try:
-                    self.usb_device.write(b'', timeout=1)
-                except:
-                    pass
-                
-                # Small delay to let device process
-                time.sleep(0.1)
-                
-                self.log(f"    Reading finalization response (device writing to flash, may take 2 minutes)...")
-                resp = None
-                try:
-                    resp = self.usb_device.read(64, timeout=120)
-                except Exception as e:
-                    self.log(f"      Timeout after 120s: {e}")
-                
-                if resp and len(resp) >= 8:
-                    # Check for error (line 14127-14138)
-                    resp_cmd, resp_data = struct.unpack("<II", resp[:8])
-                    self.log(f"    Response: cmd={resp_cmd}, data={resp_data}")
-                    if resp_cmd == 0xFFFFFFFF:
-                        self.log(f"ERROR: Finalize rejected, code={resp_data}")
-                        return False
-                    if resp_cmd != 102:
-                        self.log(f"ERROR: Unexpected response cmd={resp_cmd}")
-                        return False
-                else:
-                    # No response - log it but continue if this was last chunk
-                    self.log(f"    No response received")
-                    if completion_status == 1:
-                        self.log(f"    WARNING: No response on final chunk, continuing anyway...")
-                        # Continue - device may have accepted but not responded
-                    else:
-                        self.log(f"    ERROR: No response on intermediate chunk")
-                        return False
-                
-                offset += chunk_size
-        
-        finally:
-            # Cleanup: close file and delete temp file if used
-            if data_file is not None:
-                try:
-                    data_file.close()
-                    self.log(f"  Closed temporary file")
-                except:
-                    pass
-            
-            if temp_file_path is not None:
-                try:
-                    os.unlink(temp_file_path)
-                    self.log(f"  Deleted temporary file: {temp_file_path}")
-                except Exception as e:
-                    self.log(f"  Warning: Could not delete temp file: {e}")
-        
-        self.log(f"✓ Complete: {item.filename}")
-        return True
-    
-    def upload_binaries(self, firmware_data: FirmwareData, pit_data=None) -> bool:
-        """Upload all firmware items"""
-        self.log(f"Uploading {len(firmware_data.items)} items...")
-        
-        # Match to PIT if available
-        if pit_data:
-            from .pit import PitParser
-            pit = PitParser(self.verbose).parse(pit_data) if isinstance(pit_data, bytes) else pit_data
-            
-            for item in firmware_data.items:
-                fname = item.filename.lower()
-                # Remove ALL extensions for matching
-                fname_base = fname.replace('.lz4', '').replace('.gz', '').replace('.img', '').replace('.bin', '')
-                
-                matched = False
-                for entry in pit.entries:
-                    part_name = entry.partition_name.lower()
-                    flash_name = entry.flash_filename.lower()
-                    flash_name_base = flash_name.replace('.img', '').replace('.bin', '')
-                    
-                    # Match with various extension combinations
-                    if (fname == flash_name or  # Exact match
-                        fname_base == flash_name_base or  # Both without extensions
-                        fname_base == part_name or  # File base = partition name
-                        fname_base.replace('-', '_') == part_name.replace('-', '_')):  # With dash/underscore normalization
-                        item.info.partition_id = entry.partition_id
-                        item.info.device_type = entry.device_type
-                        self.log(f"  Matched: {item.filename} → {entry.partition_name} (ID={entry.partition_id}, type={entry.device_type})")
-                        matched = True
+                        if decompressed_chunk:
+                            total_size += len(decompressed_chunk)
+                            
+                            # Log progress for large files
+                            if total_size % (500 * 1024 * 1024) < len(decompressed_chunk):
+                                self.log(f"    Calculated size so far: {total_size / (1024*1024):.1f} MB")
+                        
+                        compressed_offset += bytes_read if bytes_read > 0 else len(compressed_chunk)
+                        
+                        if bytes_read == 0 and len(decompressed_chunk) == 0:
+                            compressed_offset = end_offset
+                            
+                    except lz4.frame.Lz4FrameEOFError:
                         break
                 
-                if not matched:
-                    self.log(f"  WARNING: No PIT match for {item.filename} (keeping ID={item.info.partition_id}, type={item.info.device_type})")
-                    # Try to detect device_type based on common patterns
-                    # Most Samsung partitions use device_type=2
-                    if item.info.device_type == 0:
-                        item.info.device_type = 2  # Default device type for most partitions
-                        self.log(f"    Set default device_type=2 for {item.filename}")
+                return total_size
+                
+            except AttributeError:
+                # Fallback to regular decompression if streaming not available
+                self.log(f"  LZ4 streaming not available, using full decompression")
+                decompressed = lz4.frame.decompress(compressed_data)
+                return len(decompressed)
+        
         else:
-            # No PIT - use filename-based detection
-            self.log("  No PIT - detecting partitions from filenames...")
-            for item in firmware_data.items:
-                fname = item.filename.lower()
-                # Common Samsung partition names
-                if 'boot' in fname and 'recovery' not in fname:
-                    item.info.partition_id = 3
-                    item.info.device_type = 2  # Most common device type
-                    self.log(f"  {item.filename} → BOOT (ID=3, type=2)")
-                elif 'recovery' in fname:
-                    item.info.partition_id = 10
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → RECOVERY (ID=10, type=2)")
-                elif 'system' in fname:
-                    item.info.partition_id = 20
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → SYSTEM (ID=20, type=2)")
-                elif 'cache' in fname:
-                    item.info.partition_id = 21
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → CACHE (ID=21, type=2)")
-                elif 'userdata' in fname:
-                    item.info.partition_id = 22
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → USERDATA (ID=22, type=2)")
-                elif 'vendor' in fname:
-                    item.info.partition_id = 23
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → VENDOR (ID=23, type=2)")
-                elif 'modem' in fname or 'radio' in fname or 'cp' in fname:
-                    item.info.partition_id = 11
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → MODEM/CP (ID=11, type=2)")
-                elif 'sboot' in fname or fname.startswith('bl') or 'bootloader' in fname:
-                    item.info.partition_id = 80
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → BOOTLOADER (ID=80, type=2)")
-                elif 'csc' in fname or 'omr' in fname:
-                    item.info.partition_id = 24
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → CSC (ID=24, type=2)")
-                elif 'hidden' in fname:
-                    item.info.partition_id = 25
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → HIDDEN (ID=25, type=2)")
-                elif 'efs' in fname:
-                    item.info.partition_id = 2
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → EFS (ID=2, type=2)")
-                elif 'param' in fname:
-                    item.info.partition_id = 15
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → PARAM (ID=15, type=2)")
-                elif 'persist' in fname:
-                    item.info.partition_id = 26
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → PERSIST (ID=26, type=2)")
-                elif 'super' in fname:
-                    item.info.partition_id = 30
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → SUPER (ID=30, type=2)")
-                elif 'vbmeta' in fname:
-                    item.info.partition_id = 31
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → VBMETA (ID=31, type=2)")
-                elif 'dtbo' in fname:
-                    item.info.partition_id = 32
-                    item.info.device_type = 2
-                    self.log(f"  {item.filename} → DTBO (ID=32, type=2)")
-                else:
-                    # Set device_type even for unknown partitions
-                    if item.info.device_type == 0:
-                        item.info.device_type = 2
-                    self.log(f"  {item.filename} → UNKNOWN (keeping ID={item.info.partition_id}, type={item.info.device_type})")
-        
-        self.progress.total_items = len(firmware_data.items)
-        
-        for i, item in enumerate(firmware_data.items):
-            self.progress.current_item = i
-            
-            # Skip meta-data files (fota.zip, etc.) - Odin4 line 14366
-            if 'meta-data/' in item.filename or item.filename.endswith('.zip'):
-                self.log(f"  Skipping meta-data file: {item.filename}")
-                continue
-            
-            if not self.transmit_data(item):
-                return False
-        
-        return True
+            # Unknown compression - return compressed size
+            return len(compressed_data)
     
-    def close_connection(self) -> bool:
+    def list_devices(self) -> List[DeviceInfo]:
         """
-        Close connection (End Session)
+        List all connected Samsung devices in Download mode
         
-        Sends END_SESSION command to tell device flashing is complete.
-        This is CRITICAL - without it, device thinks flash failed!
+        Returns:
+            List of DeviceInfo objects
         """
-        self.log("Sending END_SESSION command...")
+        return UsbDevice.list_devices()
+    
+    def connect_device(self, device_index: int = 0) -> DeviceInfo:
+        """
+        Connect to Samsung device
+        
+        Args:
+            device_index: Device index if multiple devices connected
+            
+        Returns:
+            DeviceInfo object
+        """
+        self.log("Connecting to device...")
+        
+        # Create USB device
+        self.usb_device = UsbDevice(verbose=self.verbose)
+        
+        # Find device
+        device_info = self.usb_device.find_device()
+        if device_info is None:
+            raise OdinConnectionError("No Samsung device found in Download mode")
+        
+        self.log(f"Found device: {device_info}")
+        
+        # Connect to device
+        if not self.usb_device.connect():
+            raise OdinConnectionError("Failed to connect to device")
+        
+        # Create download engine
+        self.download_engine = DownloadEngine(self.usb_device, verbose=self.verbose)
+        
+        # Do initial handshake and protocol detection ONLY
+        # Full initialization (with total bytes) happens in flash()
+        if not self.download_engine.handshake():
+            raise OdinConnectionError("Failed handshake")
+        
+        buf = bytearray(1024)  # use 1024 byte packets
+        struct.pack_into("<III", buf, 0, 100, 0, 4)  # cmd=100, sub=0, param=4
+        self.usb_device.write(bytes(buf[:self.download_engine.packet_size]))
+        resp = self.usb_device.read(64, timeout=60)  # odin4.c: 60s timeout
+        
+        device_default_packet_size = 0
+        if len(resp) >= 8:
+            cmd, data = struct.unpack("<II", resp[:8])
+            version = (data >> 16) & 0xFFFF
+            device_default_packet_size = data & 0xFFFF  # Lower 16 bits
+            self.download_engine._protocol_version = version
+            self.log(f"Protocol version: {version}, default packet size: {device_default_packet_size}")
+        
+        # Send file part size ONLY if device supports it (deviceDefaultPacketSize != 0)
+        if device_default_packet_size != 0:
+            self.log("Sending file part size (100/5)...")
+            buf = bytearray(1024)
+            struct.pack_into("<III", buf, 0, 100, 5, 0x100000)  # 1MB
+            self.usb_device.write(bytes(buf[:self.download_engine.packet_size]))
+            resp = self.usb_device.read(64, timeout=60)  # odin4.c: 60s timeout
+            if len(resp) >= 8:
+                cmd, result = struct.unpack("<II", resp[:8])
+                self.log(f"File part size response: {result}")
+                if result != 0:
+                    raise OdinConnectionError(f"Device rejected file part size: {result}")
+        
+        # Get device info
+        self.device_info = self.download_engine.get_device_info()
+        self.is_connected = True
+        
+        self.log(f"Connected to device: {self.device_info}")
+        
+        return self.device_info
+    
+    def disconnect_device(self):
+        """Disconnect from device"""
+        if self.download_engine is not None:
+            self.download_engine.close_connection()
+        
+        if self.usb_device is not None:
+            self.usb_device.disconnect()
+        
+        self.is_connected = False
+        self.log("Disconnected from device")
+    
+    def load_firmware(self, firmware_path: str, verify_hash: bool = True) -> FirmwareData:
+        """
+        Load and parse firmware file
+        
+        Args:
+            firmware_path: Path to firmware file
+            verify_hash: Whether to verify MD5 hash
+            
+        Returns:
+            FirmwareData object
+        """
+        self.log(f"Loading firmware: {firmware_path}")
+        
+        firmware_data = self.firmware_parser.parse(firmware_path, verify_hash)
+        
+        self.log(f"Loaded {len(firmware_data.items)} firmware items")
+        
+        return firmware_data
+    
+    def load_pit(self, pit_path: str) -> PitData:
+        """
+        Load and parse PIT file
+        
+        Args:
+            pit_path: Path to PIT file
+            
+        Returns:
+            PitData object
+        """
+        self.log(f"Loading PIT: {pit_path}")
+        
+        with open(pit_path, 'rb') as f:
+            pit_data = f.read()
+        
+        pit = self.pit_parser.parse(pit_data)
+        
+        self.log(f"Loaded PIT with {len(pit.entries)} entries")
+        
+        return pit
+    
+    def flash_multi_section(
+        self,
+        firmware_sections: Dict[str, FirmwareData],
+        pit_data: Optional[bytes] = None,
+        reboot: bool = True,
+        reboot_to_download: bool = False,
+        progress_callback: Optional[Callable[[DownloadProgress], None]] = None
+    ) -> bool:
+        """
+        Flash multiple firmware sections (BL, AP, CP, CSC, etc.) to device
+        
+        Args:
+            firmware_sections: Dict mapping section names to FirmwareData objects
+                              e.g., {"BL": fw_bl, "AP": fw_ap, "CP": fw_cp, "CSC": fw_csc}
+            pit_data: PIT data (optional)
+            reboot: Whether to reboot after flashing
+            reboot_to_download: Whether to reboot to download mode (default: False = reboot to system)
+            progress_callback: Progress callback function
+            
+        Returns:
+            True if flashing successful
+        """
+        if not self.is_connected:
+            raise OdinConnectionError("Not connected to device")
+        
+        if self.download_engine is None:
+            raise OdinException("Download engine not initialized")
+        
+        # Merge all firmware sections into one
+        merged_firmware = FirmwareData()
+        for section_name, firmware_data in firmware_sections.items():
+            self.log(f"Adding section {section_name}: {len(firmware_data.items)} items")
+            merged_firmware.items.extend(firmware_data.items)
+            
+            # Use PIT from first section that has it
+            if firmware_data.pit_data and not merged_firmware.pit_data:
+                merged_firmware.pit_data = firmware_data.pit_data
+        
+        self.log(f"Total merged items: {len(merged_firmware.items)}")
+        
+        # Flash the merged firmware
+        return self.flash(
+            merged_firmware,
+            pit_data=pit_data,
+            reboot=reboot,
+            reboot_to_download=reboot_to_download,
+            progress_callback=progress_callback
+        )
+    
+    def flash(
+        self,
+        firmware_data: FirmwareData,
+        pit_data: Optional[bytes] = None,
+        reboot: bool = True,
+        reboot_to_download: bool = False,
+        progress_callback: Optional[Callable[[DownloadProgress], None]] = None
+    ) -> bool:
+        """
+        Flash firmware to device
+        
+        Args:
+            firmware_data: Firmware data to flash
+            pit_data: PIT data (optional)
+            reboot: Whether to reboot after flashing
+            reboot_to_download: Whether to reboot to download mode (default: False = reboot to system)
+            progress_callback: Progress callback function
+            
+        Returns:
+            True if flashing successful
+        """
+        if not self.is_connected:
+            raise OdinConnectionError("Not connected to device")
+        
+        if self.download_engine is None:
+            raise OdinException("Download engine not initialized")
+        
+        self.log("Starting firmware flash...")
+        
+        # Set progress callback
+        if progress_callback is not None:
+            self.download_engine.set_progress_callback(progress_callback)
         
         try:
-            # Send END_SESSION (command 103/0) - tells device we're done
-            buf = bytearray(1024)
-            struct.pack_into("<III", buf, 0, 103, 0, 0)
-            self.usb_device.write(bytes(buf[:self.packet_size]))
+            # CRITICAL: Protocol sequence from odin4.c line 15120-15175:
+            # 1. setupConnection (handshake - done in connect_device)
+            # 2. initializeConnection (100/0, 100/5, 100/2 with total) - done here
+            # 3. sendPitInfo
+            # 4. receivePitInfo
+            # 5. uploadBinaries
             
-            # Try to read response (device may not always respond)
-            try:
-                resp = self.usb_device.read(64, timeout=2)
-                if len(resp) >= 8:
-                    resp_cmd, resp_data = struct.unpack("<II", resp[:8])
-                    self.log(f"  END_SESSION response: cmd={resp_cmd}, data={resp_data}")
+            # Calculate ACTUAL total bytes that will be transmitted
+            # Use streaming decompression to get size without exhausting memory
+            total_bytes = 0
+            for item in firmware_data.items:
+                if item.data is None:
+                    continue
+                
+                # Skip meta-data files
+                if 'meta-data/' in item.filename or item.filename.endswith('.zip'):
+                    continue
+                
+                # Calculate decompressed size if compressed
+                if item.info.is_compressed:
+                    try:
+                        decompressed_size = self._get_decompressed_size(item)
+                        total_bytes += decompressed_size
+                    except Exception as e:
+                        self.log(f"  WARNING: Could not determine decompressed size for {item.filename}: {e}")
+                        total_bytes += len(item.data)
                 else:
-                    self.log(f"  END_SESSION: no response (normal)")
-            except:
-                self.log(f"  END_SESSION: no response (normal)")
+                    total_bytes += len(item.data)
             
-            self.log("✓ Session closed")
+            self.log(f"Total bytes to send: {total_bytes} ({total_bytes/1024/1024:.1f} MB)")
+            
+            # STEP 2: Send 100/2 with total bytes - MUST be before PIT!
+            # CRITICAL: Must match odin4.c requestAndResponse with array parameter!
+            # odin4.c line 12996-13001: cmd, sub, then 8 DWORDs from array
+            self.log("Completing initialization (100/2 with total bytes)...")
+            buf = bytearray(1024)  # Use 1024 byte packets
+            struct.pack_into("<II", buf, 0, 100, 2)  # cmd, sub
+            struct.pack_into("<Q", buf, 8, total_bytes)  # 64-bit total at offset 8
+            # Remaining DWORDs are zeros (already zeroed in bytearray)
+            self.download_engine.usb_device.write(bytes(buf[:self.download_engine.packet_size]))
+            
+            # Wait for and validate response (odin4.c uses 60s timeout)
+            resp = self.download_engine.usb_device.read(64, timeout=60)
+            if len(resp) < 8:
+                raise OdinException("No response to 100/2 packet")
+            resp_cmd, resp_data = struct.unpack("<II", resp[:8])
+            if resp_cmd != 100:
+                raise OdinException(f"Invalid response to 100/2: cmd={resp_cmd}")
+            if resp_data != 0:
+                raise OdinException(f"Device rejected 100/2: result={resp_data}")
+            self.log(f"✓ Initialization complete")
+            
+            # STEP 2b: Send lock information ONLY if option_lock is enabled (NOT for bypass_verification!)
+            # (odin4.c line 14383-14398)
+            # This tells the phone to skip verification checks for .BIN files
+            # 
+            # NOTE: Command 100/3 is for option_lock ONLY, not for general bypass!
+            # bypass_verification is PC-SIDE ONLY - it doesn't send device commands
+            if firmware_data.option_lock:
+                self.log("Send lock information..")
+                
+                # Optionally probe support first (quick check)
+                # Note: We still attempt the full command even if probe fails,
+                # as some devices may respond slowly but still support it
+                self.log("Checking option_lock support...")
+                probe_supported = self.download_engine.probe_lock_command_support(mode="bypass", probe_timeout=2.0)
+                if not probe_supported:
+                    self.log("⚠️ Device may not support option_lock (probe timeout)")
+                    self.log("⚠️ Attempting anyway (device may respond slowly)")
+                
+                # Use download_engine's method to send the command properly
+                success = self.download_engine.send_lock_command(mode="bypass")
+                
+                if success:
+                    self.log("✓ Lock information sent (phone verification disabled)")
+                else:
+                    # Some devices don't support option_lock - log warning but continue
+                    # This is safer than aborting, as option_lock is optional
+                    self.log("⚠️ Lock operation failed or not supported by device")
+                    self.log("⚠️ Continuing without option_lock - device may still verify signatures")
+                    # Don't abort - just continue without option_lock
+            
+            elif self.bypass_verification:
+                self.log("⚠️ BYPASS MODE: PC-side verification disabled")
+                self.log("⚠️ Device will still verify signatures (use --option-lock for device bypass)")
+            
+            pit_for_matching = None
+            
+            # Check protocol version
+            protocol_version = self.device_info.protocol_version if self.device_info else 2
+            self.log(f"Device protocol version: {protocol_version}")
+            
+            # For protocol v2/v3: MUST call sendPitInfo then receivePitInfo
+            if protocol_version <= 3:
+                self.log("Protocol v2/v3 detected - will retrieve PIT...")
+                
+                # Step 3: sendPitInfo (line 15151-15158)
+                self.log("Calling sendPitInfo...")
+                if not self.download_engine.send_pit_info():
+                    raise OdinException("sendPitInfo failed")
+                
+                # If we have PIT data to send, send it
+                if pit_data is not None:
+                    self.log("Sending PIT data...")
+                    if not self.download_engine.send_pit_data(pit_data):
+                        raise OdinException("Failed to send PIT data")
+                    pit_for_matching = pit_data
+                elif firmware_data.pit_data is not None:
+                    self.log("Sending embedded PIT data...")
+                    if not self.download_engine.send_pit_data(firmware_data.pit_data):
+                        raise OdinException("Failed to send embedded PIT data")
+                    pit_for_matching = firmware_data.pit_data
+                # else: No PIT to send (sendPitInfo returns success immediately)
+                
+                # Step 2b: receivePitInfo (line 15159-15162) - ALWAYS for v2/v3
+                self.log("Receiving PIT from device...")
+                try:
+                    pit_for_matching = self.dump_pit()
+                    self.log(f"✓ Retrieved PIT ({len(pit_for_matching)} bytes)")
+                except Exception as e:
+                    self.log(f"ERROR: Could not retrieve PIT: {e}")
+                    raise
+            else:
+                # Protocol v4+ may not need PIT
+                if pit_data is not None:
+                    self.log("Sending PIT data...")
+                    if not self.download_engine.send_pit_data(pit_data):
+                        raise OdinException("Failed to send PIT data")
+                    pit_for_matching = pit_data
+                elif firmware_data.pit_data is not None:
+                    self.log("Sending embedded PIT data...")
+                    if not self.download_engine.send_pit_data(firmware_data.pit_data):
+                        raise OdinException("Failed to send embedded PIT data")
+                    pit_for_matching = firmware_data.pit_data
+            
+            # Upload firmware binaries (with PIT for partition matching)
+            self.log("Uploading firmware binaries...")
+            if not self.download_engine.upload_binaries(firmware_data, pit_for_matching):
+                raise OdinException("Failed to upload firmware binaries")
+            
+            self.log("Firmware flashed successfully!")
+            
+            # CRITICAL: Close session properly before rebooting
+            # This tells the device we're done and flashing was successful
+            self.log("Closing session...")
+            try:
+                self.download_engine.close_connection()
+                time.sleep(0.5)  # Give device time to process
+            except Exception as e:
+                self.log(f"Warning: Error closing connection: {e}")
+            
+            # Reboot device if requested
+            if reboot:
+                boot_target = "download mode" if reboot_to_download else "system"
+                self.log(f"Rebooting device to {boot_target}...")
+                try:
+                    self.download_engine.reboot_device(to_download_mode=reboot_to_download)
+                    time.sleep(1)  # Wait a bit before disconnect
+                except:
+                    # Device disconnects during reboot - this is normal
+                    pass
+            
             return True
             
         except Exception as e:
-            self.log(f"ERROR closing connection: {e}")
-            return False
+            self.log(f"Flashing failed: {e}")
+            raise
     
-    def _send_packet(self, cmd, sub, param):
+    def dump_pit(self) -> bytes:
         """
-        Send simple packet - EXACT odin4.c implementation
+        Dump PIT from device
         
-        From odin4.c line 12829-12840:
-        - Creates 0x800 (2048) byte buffer
-        - Packs cmd, sub, param at start
-        - Writes exactly packet_size bytes
+        Returns:
+            PIT data
         """
-        buf = bytearray(0x800)  # 2048 bytes
-        struct.pack_into("<III", buf, 0, cmd, sub, param)
-        return self.usb_device.write(bytes(buf[:self.packet_size]))
+        if not self.is_connected:
+            raise OdinConnectionError("Not connected to device")
+        
+        if self.download_engine is None:
+            raise OdinException("Download engine not initialized")
+        
+        self.log("Dumping PIT from device...")
+        
+        # Use the new receive_pit_data method which handles the full protocol
+        pit_data = self.download_engine.receive_pit_data()
+        
+        self.log(f"PIT dumped successfully ({len(pit_data)} bytes)")
+        
+        return pit_data
+    
+    def verify_firmware(self, firmware_data: FirmwareData) -> bool:
+        """
+        Verify firmware integrity
+        
+        Args:
+            firmware_data: Firmware data to verify
+            
+        Returns:
+            True if verification successful
+        """
+        self.log("Verifying firmware...")
+        
+        # Check if MD5 hash is present
+        if firmware_data.md5_hash:
+            self.log(f"MD5 hash: {firmware_data.md5_hash}")
+            # MD5 was already verified during parsing if requested
+        
+        # Check manifest if present
+        if firmware_data.manifest is not None:
+            self.log("Manifest present")
+        
+        self.log("Firmware verification complete")
+        
+        return True
+    
+    def get_device_info(self) -> Optional[DeviceInfo]:
+        """
+        Get connected device information
+        
+        Returns:
+            DeviceInfo or None if not connected
+        """
+        return self.device_info
     
     def enumerate_command_params(self, cmd: int, sub: int, param_range: range = None, 
                                  probe_timeout: float = 2.0, verbose: bool = True) -> dict:
         """
-        Enumerate which parameter values a device accepts for a given command.
+        Enumerate which parameter values the device accepts for a given command.
         
-        This tries different parameter values and records which ones the device
-        accepts (responds with matching command ID) vs rejects (error/timeout).
+        This is useful for discovering what parameters a device supports without
+        having to manually test each one.
         
         Args:
             cmd: Command ID (e.g., 100)
@@ -870,277 +610,90 @@ class DownloadEngine:
             verbose: If True, log each attempt (default: True)
         
         Returns:
-            dict with keys:
-                - 'accepted': list of param values that device accepted
-                - 'rejected': list of param values that device rejected (error response)
-                - 'timeout': list of param values that timed out (no response)
-                - 'unexpected': list of param values with unexpected responses
+            dict with 'accepted', 'rejected', 'timeout', 'unexpected' lists
         """
-        if param_range is None:
-            param_range = range(256)  # Default: 0-255
+        if not self.is_connected:
+            raise OdinConnectionError("Device not connected")
         
-        results = {
-            'accepted': [],
-            'rejected': [],
-            'timeout': [],
-            'unexpected': []
-        }
+        if not self.download_engine:
+            raise OdinException("Download engine not initialized")
         
-        total = len(param_range)
-        self.log(f"Enumerating parameters for command {cmd}/{sub} (testing {total} values)...")
-        
-        for idx, param in enumerate(param_range):
-            if verbose and (idx % 16 == 0 or idx == total - 1):
-                self.log(f"  Testing param={param} ({idx+1}/{total})...")
-            
-            # Pack command
-            buf = bytearray(0x800)
-            struct.pack_into("<III", buf, 0, cmd, sub, param)
-            
-            try:
-                written = self.usb_device.write(bytes(buf[:self.packet_size]))
-                if written != self.packet_size:
-                    if verbose:
-                        self.log(f"    ✗ Write failed for param={param}")
-                    results['timeout'].append(param)
-                    continue
-                
-                # Try to read response
-                try:
-                    resp = self.usb_device.read(64, timeout=probe_timeout)
-                    if resp and len(resp) >= 8:
-                        resp_cmd, resp_data = struct.unpack("<II", resp[:8])
-                        
-                        # Check response
-                        if resp_cmd == cmd:
-                            # Device accepted this parameter
-                            results['accepted'].append(param)
-                            if verbose:
-                                self.log(f"    ✓ param={param} ACCEPTED (data={resp_data})")
-                        elif resp_cmd == 0xFFFFFFFF or resp_cmd == -1:
-                            # Device rejected with error
-                            results['rejected'].append(param)
-                            if verbose:
-                                self.log(f"    ✗ param={param} REJECTED (error -1)")
-                        else:
-                            # Unexpected response
-                            results['unexpected'].append((param, resp_cmd, resp_data))
-                            if verbose:
-                                self.log(f"    ? param={param} UNEXPECTED (cmd={resp_cmd}, data={resp_data})")
-                    else:
-                        # Partial response
-                        results['timeout'].append(param)
-                        if verbose:
-                            self.log(f"    ? param={param} TIMEOUT (partial response)")
-                except OdinTimeoutError:
-                    # No response - device doesn't support this parameter
-                    results['timeout'].append(param)
-                    if verbose and idx % 16 == 0:
-                        self.log(f"    ? param={param} TIMEOUT (no response)")
-                except Exception as e:
-                    results['timeout'].append(param)
-                    if verbose:
-                        self.log(f"    ✗ param={param} ERROR: {e}")
-            except Exception as e:
-                results['timeout'].append(param)
-                if verbose:
-                    self.log(f"    ✗ param={param} ERROR: {e}")
-        
-        # Summary
-        self.log(f"\nEnumeration complete for {cmd}/{sub}:")
-        self.log(f"  ✓ Accepted: {len(results['accepted'])} params {results['accepted'][:20]}{'...' if len(results['accepted']) > 20 else ''}")
-        self.log(f"  ✗ Rejected: {len(results['rejected'])} params {results['rejected'][:20]}{'...' if len(results['rejected']) > 20 else ''}")
-        self.log(f"  ? Timeout: {len(results['timeout'])} params")
-        if results['unexpected']:
-            self.log(f"  ? Unexpected: {len(results['unexpected'])} params")
-            for param, resp_cmd, resp_data in results['unexpected'][:5]:
-                self.log(f"      param={param}: cmd={resp_cmd}, data={resp_data}")
-        
-        return results
+        return self.download_engine.enumerate_command_params(
+            cmd, sub, param_range, probe_timeout, verbose
+        )
     
-    def probe_lock_command_support(self, mode: str = "bypass", probe_timeout: float = 2.0) -> bool:
+    def check_oem_unlock_support(self) -> bool:
         """
-        Probe if device supports lock/unlock command (100/3) without waiting full timeout.
+        Check if device supports OEM unlock command (100/3 with param=0).
         
-        This sends the command with a short timeout to quickly determine if the device
-        responds. Useful for checking support before attempting the full command.
-        
-        Args:
-            mode: "bypass" (param=1) or "unlock" (param=0)
-            probe_timeout: Timeout in seconds for probe (default 2.0s)
+        This probes the device with a short timeout to determine support
+        without actually unlocking the bootloader.
         
         Returns:
-            True if device responds (supports command), False if timeout/not supported
+            True if device appears to support OEM unlock, False otherwise
         """
-        if mode not in ["bypass", "unlock"]:
-            raise ValueError(f"Invalid mode '{mode}', must be 'bypass' or 'unlock'")
+        if not self.is_connected:
+            raise OdinConnectionError("Device not connected")
         
-        param = 1 if mode == "bypass" else 0
-        action = "Bypass/Lock" if mode == "bypass" else "OEM Unlock"
+        if not self.download_engine:
+            raise OdinException("Download engine not initialized")
         
-        self.log(f"Probing {action} support (100/3, param={param}, timeout={probe_timeout}s)...")
-        
-        # Pack command exactly as odin4.c
-        buf = bytearray(0x800)
-        struct.pack_into("<III", buf, 0, 100, 3, param)
-        
-        written = self.usb_device.write(bytes(buf[:self.packet_size]))
-        if written != self.packet_size:
-            return False
-        
-        # Try to read response with short timeout
-        try:
-            resp = self.usb_device.read(64, timeout=probe_timeout)
-            if resp and len(resp) >= 8:
-                resp_cmd, _ = struct.unpack("<II", resp[:8])
-                # Device responded - check if it's a valid response
-                if resp_cmd == 100:
-                    self.log(f"  ✓ Device supports {action} command")
-                    return True
-                elif resp_cmd == 0xFFFFFFFF or resp_cmd == -1:
-                    self.log(f"  ✗ Device rejected {action} command")
-                    return False
-                else:
-                    self.log(f"  ? Device responded with unexpected cmd={resp_cmd}")
-                    return False
-            else:
-                # Partial response - device might be processing
-                self.log(f"  ? Partial response ({len(resp) if resp else 0} bytes)")
-                return False
-        except OdinTimeoutError:
-            # No response within probe timeout - device likely doesn't support it
-            self.log(f"  ✗ No response (device may not support {action})")
-            return False
-        except Exception as e:
-            self.log(f"  ✗ Probe error: {e}")
-            return False
+        return self.download_engine.probe_lock_command_support(mode="unlock", probe_timeout=2.0)
     
-    def send_lock_command(self, mode: str = "bypass"):
+    def oem_unlock(self, check_support: bool = True) -> bool:
         """
-        Send lock/unlock command (100/3) - odin4.c line 14390
+        Send OEM bootloader unlock command to device
         
-        EXACT implementation from odin4.c:
-        - Packs: cmd=100, sub=3, param at offset 8
-        - Success if response cmd == request cmd (100)
+        WARNING: This is a DESTRUCTIVE operation that may:
+        - Wipe all user data
+        - Void warranty
+        - Brick device if not supported
         
-        Modes:
-          - "bypass" (param=1): Bypass verification for this session (option_lock in odin4)
-            ✓ Verified: odin4.c uses this (line 14390)
-          - "unlock" (param=0): OEM bootloader unlock command
-            ⚠ UNVERIFIED: odin4.c never uses param=0, implementation is based on protocol structure
-        
-        Returns True if accepted, False if rejected.
-        """
-        if mode not in ["bypass", "unlock"]:
-            raise ValueError(f"Invalid mode '{mode}', must be 'bypass' or 'unlock'")
-        
-        param = 1 if mode == "bypass" else 0
-        action = "Bypass/Lock" if mode == "bypass" else "OEM Unlock"
-        
-        self.log(f"Sending {action} command (100/3, param={param})...")
-        
-        # Pack EXACTLY as odin4.c requestAndResponse does (line 14092-14096):
-        # memset(v17, 0, 0x800u);
-        # v17[0] = a2;  // cmd = 100
-        # v17[1] = a3;  // sub = 3
-        # v17[2] = a5;  // param = 1 (bypass) or 0 (unlock)
-        buf = bytearray(0x800)
-        struct.pack_into("<III", buf, 0, 100, 3, param)
-        
-        written = self.usb_device.write(bytes(buf[:self.packet_size]))
-        if written != self.packet_size:
-            self.log(f"Write failed: {written} != {self.packet_size}")
-            return False
-        
-        # Read response EXACTLY as odin4.c requestAndResponse (line 14110-14124):
-        # - Request 64 bytes, but must receive exactly 8 bytes
-        # - Timeout: 60000ms (60 seconds) - line 14116
-        # - Retry up to 2 times if read returns 0 bytes (line 14109-14121)
-        # - v11 = bytes read, must be exactly 8 (line 14123)
-        timeout = 60  # 60000ms = 60 seconds (line 14116)
-        max_retries = 2  # v10 = 2 (line 14109)
-        bytes_read = 0
-        resp = None
-        
-        for retry in range(max_retries):
-            try:
-                self.log(f"  Reading response (attempt {retry + 1}/{max_retries}, timeout={timeout}s)...")
-                # Request 64 bytes but we only need 8 (line 14115)
-                resp = self.usb_device.read(64, timeout=timeout)
-                bytes_read = len(resp) if resp else 0
-                
-                # odin4.c line 14118: if ( v11 ) break;
-                # v11 is the return value (bytes read), so if > 0, break
-                if bytes_read > 0:
-                    self.log(f"  Read {bytes_read} bytes")
-                    break
-                else:
-                    # odin4.c line 14120: if ( !--v10 ) return 0;
-                    # Retry if read returned 0 bytes
-                    self.log(f"  Read returned 0 bytes, retrying...")
-                    if retry == max_retries - 1:
-                        self.log("✗ No response after retries")
-                        return False
-                    continue
-                    
-            except OdinTimeoutError:
-                # Timeout means device didn't respond - some devices don't support 100/3
-                self.log(f"  Read timed out after {timeout}s (device may not support this command)")
-                return False
-            except (OdinUSBError, Exception) as e:
-                self.log(f"✗ Read error: {e}")
-                return False
-        
-        # odin4.c line 14123-14124: if ( v11 != 8 ) return 0;
-        # Must receive exactly 8 bytes
-        if bytes_read != 8:
-            self.log(f"✗ Invalid response size: expected exactly 8 bytes, got {bytes_read}")
-            return False
-        
-        # Parse response (line 14127-14138)
-        # v13 = response command (first 4 bytes, signed int)
-        # v14 = response data (next 4 bytes, not checked for 100/3)
-        resp_cmd, resp_data = struct.unpack("<II", resp[:8])
-        self.log(f"  Response: cmd={resp_cmd}, data={resp_data}")
-        
-        # odin4.c success check (line 14127):
-        # if ( v13 == -1 || a2 != v13 ) return 0;
-        # return 1;
-        # v13 is signed int, so -1 is 0xFFFFFFFF as unsigned
-        if resp_cmd == 0xFFFFFFFF or resp_cmd == -1:
-            self.log(f"✗ {action} command returned error (-1)")
-            return False
-        
-        if resp_cmd != 100:  # a2 != v13
-            self.log(f"✗ {action} command rejected: expected cmd=100, got cmd={resp_cmd}")
-            return False
-        
-        # Success! Response cmd matches request cmd (line 14139)
-        self.log(f"✓ {action} command accepted")
-        return True
-    
-    def reboot_device(self, to_download_mode: bool = False) -> bool:
-        """
-        Reboot device
+        NOTE: OEM unlock (100/3 param=0) is UNVERIFIED in odin4.c source.
+        odin4.c only uses param=1 (bypass). This implementation is based on
+        protocol structure but has not been verified against actual devices.
         
         Args:
-            to_download_mode: If True, reboot to download mode. If False, reboot to system (normal boot)
+            check_support: If True, probe device first to check support (default: True)
         
-        Commands (based on Odin protocol):
-        - 103/0 = End session (no reboot)
-        - 103/1 = Reboot to system (normal boot)
-        - 103/2 = Reboot to download mode
+        Returns:
+            True if command accepted, False otherwise
         """
-        sub_command = 2 if to_download_mode else 1  # Use 1 for system reboot, not 0
-        self.log(f"Rebooting device (sub={sub_command}, to_download={to_download_mode})...")
+        if not self.is_connected:
+            raise OdinConnectionError("Device not connected")
         
-        try:
-            self._send_packet(103, sub_command, 0)
-        except:
-            # Device may disconnect before write completes
-            pass
-        try:
-            self.usb_device.read(8, timeout=2)
-        except:
-            pass
-        return True
+        if not self.download_engine:
+            raise OdinException("Download engine not initialized")
+        
+        # Optionally check support first
+        if check_support:
+            self.log("Checking OEM unlock support...")
+            if not self.download_engine.probe_lock_command_support(mode="unlock", probe_timeout=2.0):
+                self.log("⚠️ Device may not support OEM unlock command")
+                self.log("⚠️ Continuing anyway (device may still process it)")
+        
+        self.log("=" * 60)
+        self.log("WARNING: Sending OEM UNLOCK command")
+        self.log("This will permanently unlock the bootloader")
+        self.log("=" * 60)
+        
+        # Send 100/3 with parameter 0 for OEM unlock
+        success = self.download_engine.send_lock_command(mode="unlock")
+        
+        if success:
+            self.log("✓ OEM unlock command accepted by device")
+            self.log("Device may reboot or require power cycle")
+        else:
+            self.log("✗ OEM unlock command rejected or not supported")
+        
+        return success
+    
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        if self.is_connected:
+            self.disconnect_device()
+
