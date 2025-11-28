@@ -14,3 +14,4 @@ Additional options:
 - OEM Unlock (only for some devices)
 - Disable signature verification (For flashing client side, on Bootloader it will STILL enforce)
 - Option Lock
+- Unbricks devices that have a failed software update
