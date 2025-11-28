@@ -14,7 +14,15 @@ from typing import List, Optional, Dict, Any, BinaryIO
 from dataclasses import dataclass, field
 
 from .exceptions import OdinFirmwareError
-from .crypto_utils import verify_md5, verify_sha256, CryptoVerifier, calculate_md5_file
+from .crypto_utils import (
+    verify_md5,
+    verify_sha256,
+    CryptoVerifier,
+    calculate_md5_file,
+    enable_verification_bypass,
+    disable_verification_bypass,
+    is_bypass_enabled
+)
 from .constants import (
     TAR_SIGNATURE,
     GZIP_SIGNATURE,
@@ -133,14 +141,37 @@ class FirmwareParser:
     - LZ4 compressed files
     """
     
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, bypass_verification: bool = False):
         self.verbose = verbose
         self.verifier = CryptoVerifier(verbose=verbose)
+        self.bypass_verification = bypass_verification
+        
+        # Enable bypass if requested (mimics odin4.c v32=0 behavior)
+        if bypass_verification:
+            enable_verification_bypass()
+            self.log("[BYPASS] ⚠️  Verification bypass ENABLED for firmware parsing")
     
     def log(self, message: str):
         """Print log message if verbose"""
         if self.verbose:
             print(f"[FirmwareParser] {message}")
+    
+    def enable_bypass(self):
+        """
+        Enable bootloader verification bypass (DANGEROUS!)
+        
+        Replicates odin4.c vulnerability where v32=0 or "NOTAPPLIED" 
+        bypasses all cryptographic verification.
+        """
+        self.bypass_verification = True
+        enable_verification_bypass()
+        self.log("[BYPASS] ⚠️  Verification bypass ENABLED")
+    
+    def disable_bypass(self):
+        """Disable bootloader verification bypass"""
+        self.bypass_verification = False
+        disable_verification_bypass()
+        self.log("[BYPASS] ✓ Verification bypass disabled")
     
     def parse(self, firmware_path: str, verify_hash: bool = True) -> FirmwareData:
         """
@@ -217,7 +248,10 @@ class FirmwareParser:
                         break
         
         # Verify MD5 using streaming (memory efficient) - optional for large files
-        if verify_hash and md5_hash and file_size < 500 * 1024 * 1024:  # Only verify if < 500MB
+        # BYPASS: Skip MD5 verification if bypass enabled (odin4.c line 18140: || !v32)
+        if self.bypass_verification or is_bypass_enabled():
+            self.log("[BYPASS] MD5 verification skipped (bypass enabled)")
+        elif verify_hash and md5_hash and file_size < 500 * 1024 * 1024:  # Only verify if < 500MB
             self.log("Verifying MD5 hash...")
             
             import hashlib
@@ -684,4 +718,3 @@ class FirmwareParser:
                 return gzip.decompress(data)
         except Exception as e:
             raise OdinFirmwareError(f"GZIP extraction failed: {e}")
-
