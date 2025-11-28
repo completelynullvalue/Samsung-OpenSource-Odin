@@ -15,6 +15,57 @@ from Crypto.Util.Padding import unpad
 
 from .exceptions import OdinVerificationError
 
+# ============================================================================
+# BOOTLOADER BYPASS (from odin4.c decompiled analysis)
+# ============================================================================
+# This implements the verification bypass found in Samsung's Odin4 bootloader.
+# 
+# Two bypass mechanisms discovered:
+# 1. "NOTAPPLIED" string check - skips SHA256 verification entirely
+# 2. v32 == 0 condition - bypasses all signature checks in TAR context
+#
+# SECURITY WARNING: This allows flashing unsigned firmware!
+# ============================================================================
+
+# Global bypass flag (mimics odin4.c offset +304 string field)
+_VERIFICATION_BYPASS_ENABLED = False
+_VERIFICATION_STATUS_STRING = ""  # "NOTAPPLIED" = bypass active
+
+
+def enable_verification_bypass():
+    """
+    Enable bootloader verification bypass (DANGEROUS!)
+    
+    This replicates the vulnerability found in odin4.c where setting
+    the verification status string to "NOTAPPLIED" bypasses all
+    cryptographic verification.
+    
+    WARNING: This allows flashing unsigned/modified firmware!
+    """
+    global _VERIFICATION_BYPASS_ENABLED, _VERIFICATION_STATUS_STRING
+    _VERIFICATION_BYPASS_ENABLED = True
+    _VERIFICATION_STATUS_STRING = "NOTAPPLIED"
+    print("[BYPASS] ⚠️  Verification bypass ENABLED - unsigned firmware allowed!")
+    print("[BYPASS] ⚠️  This replicates the odin4.c security vulnerability")
+
+
+def disable_verification_bypass():
+    """Disable bootloader verification bypass"""
+    global _VERIFICATION_BYPASS_ENABLED, _VERIFICATION_STATUS_STRING
+    _VERIFICATION_BYPASS_ENABLED = False
+    _VERIFICATION_STATUS_STRING = ""
+    print("[BYPASS] ✓ Verification bypass disabled")
+
+
+def is_bypass_enabled() -> bool:
+    """Check if verification bypass is enabled"""
+    return _VERIFICATION_BYPASS_ENABLED
+
+
+def get_verification_status() -> str:
+    """Get verification status string (mimics odin4.c +304 field)"""
+    return _VERIFICATION_STATUS_STRING
+
 
 def calculate_md5(data: bytes) -> str:
     """
@@ -78,6 +129,11 @@ def verify_md5(data: bytes, expected_hash: str) -> bool:
     Returns:
         True if hash matches, False otherwise
     """
+    # BYPASS: Check if verification is disabled (odin4.c line 18140: || !v32)
+    if _VERIFICATION_BYPASS_ENABLED:
+        print("[BYPASS] MD5 verification skipped (bypass enabled)")
+        return True
+    
     actual_hash = calculate_md5(data)
     return actual_hash.lower() == expected_hash.lower()
 
@@ -93,6 +149,11 @@ def verify_sha256(data: bytes, expected_hash: str) -> bool:
     Returns:
         True if hash matches, False otherwise
     """
+    # BYPASS: Check "NOTAPPLIED" status (odin4.c line 16353)
+    if _VERIFICATION_STATUS_STRING == "NOTAPPLIED":
+        print("[BYPASS] SHA256 verification skipped (NOTAPPLIED)")
+        return True
+    
     actual_hash = calculate_sha256(data)
     return actual_hash.lower() == expected_hash.lower()
 
@@ -115,6 +176,11 @@ def verify_rsa_signature(
     Returns:
         True if signature is valid, False otherwise
     """
+    # BYPASS: Replicate odin4.c Manifest::rsaVerify bypass behavior
+    if _VERIFICATION_BYPASS_ENABLED:
+        print("[BYPASS] RSA signature verification skipped (bypass enabled)")
+        return True
+    
     try:
         # Load public key
         public_key = serialization.load_pem_public_key(
@@ -239,6 +305,12 @@ class CryptoVerifier:
         Returns:
             True if hash is valid
         """
+        # BYPASS: Check if verification is disabled
+        if _VERIFICATION_BYPASS_ENABLED:
+            if self.verbose:
+                print(f"[BYPASS] {algorithm} hash verification skipped")
+            return True
+        
         if self.verbose:
             print(f"Verifying {algorithm} hash...")
         
@@ -273,6 +345,12 @@ class CryptoVerifier:
         Returns:
             True if signature is valid
         """
+        # BYPASS: Check if verification is disabled
+        if _VERIFICATION_BYPASS_ENABLED:
+            if self.verbose:
+                print("[BYPASS] RSA signature verification skipped")
+            return True
+        
         if self.verbose:
             print("Verifying RSA signature...")
         
@@ -282,4 +360,3 @@ class CryptoVerifier:
             print(f"Signature verification: {'PASS' if result else 'FAIL'}")
         
         return result
-
