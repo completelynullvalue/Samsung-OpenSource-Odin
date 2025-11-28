@@ -9,7 +9,12 @@ from typing import Optional, Dict, Any
 from dataclasses import dataclass, field
 
 from .exceptions import OdinFirmwareError, OdinVerificationError
-from .crypto_utils import verify_rsa_signature, aes_decrypt_cbc
+from .crypto_utils import (
+    verify_rsa_signature,
+    aes_decrypt_cbc,
+    is_bypass_enabled,
+    get_verification_status
+)
 
 
 @dataclass
@@ -168,6 +173,16 @@ class ManifestParser:
         Returns:
             True if signature is valid
         """
+        # BYPASS: Check "NOTAPPLIED" status (odin4.c line 16353)
+        if get_verification_status() == "NOTAPPLIED":
+            self.log("[BYPASS] Manifest signature verification skipped (NOTAPPLIED)")
+            return True
+        
+        # BYPASS: Check if verification is globally disabled (odin4.c line 18140: || !v32)
+        if is_bypass_enabled():
+            self.log("[BYPASS] Manifest signature verification skipped (bypass enabled)")
+            return True
+        
         self.log("Verifying manifest signature...")
         
         try:
@@ -243,6 +258,42 @@ class ManifestParser:
         os.makedirs(dump_dir, exist_ok=True)
         
         return os.path.join(dump_dir, filename)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
